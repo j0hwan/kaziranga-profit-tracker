@@ -29,11 +29,19 @@ function getMonthLabel(key) {
   return `${MONTHS[parseInt(m) - 1]} ${y}`;
 }
 
-// Parse MM/DD/YYYY → YYYY-MM-DD
+// Parse MM/DD/YYYY or M/D/YY → YYYY-MM-DD
 // Returns { date, warning } where warning is set if format looks like DD/MM/YYYY
 function parseDate(raw) {
   if (!raw) return { date: null, warning: null };
   const s = raw.trim();
+
+  // M/D/YY or MM/DD/YY (2-digit year) — normalise to 4-digit year first
+  const shortYear = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+  if (shortYear) {
+    const yy = parseInt(shortYear[3]);
+    const fullYear = yy <= 79 ? 2000 + yy : 1900 + yy; // 00-79 -> 2000s, 80-99 -> 1900s
+    return parseDate(`${shortYear[1]}/${shortYear[2]}/${fullYear}`);
+  }
 
   // MM/DD/YYYY (required format)
   const m1 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
@@ -78,16 +86,74 @@ function parseMoney(raw) {
   return isNaN(n) ? 0 : n;
 }
 
+// RFC-4180 compliant single-row CSV splitter. Handles quoted fields containing commas
+// and escaped double-quotes ("" -> ") correctly — a plain regex/split cannot do this and
+// will silently misalign every column after a field like "15\"\"" (representing 15").
+function splitCSVRow(line) {
+  const result = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i + 1] === '"') { field += '"'; i++; } // escaped quote
+        else { inQuotes = false; }
+      } else {
+        field += c;
+      }
+    } else {
+      if (c === '"') { inQuotes = true; }
+      else if (c === ',') { result.push(field); field = ""; }
+      else { field += c; }
+    }
+  }
+  result.push(field);
+  return result;
+}
+
 // Parse the Kaziranga CSV format
+// Map the literal "Channel" column value to a normalised channel label.
+// Per business rule: "Kaziranga Outfitters" = In-Store, "Kaziranga Pro Cricket Outfitters" = Online
+// "Invoice Sales" (seen in real exports) = Bulk/Invoice — handled as its own bucket so it
+// doesn't get silently misclassified as Unknown or merged into retail channels.
+function normaliseChannel(raw) {
+  if (!raw) return "Unknown";
+  const s = raw.trim().toLowerCase();
+  if (s === "kaziranga pro cricket outfitters") return "Online";
+  if (s === "kaziranga outfitters") return "In-Store";
+  if (s === "invoice sales" || s.includes("invoice")) return "Invoice";
+  if (s.includes("payment link")) return "Payment Links";
+  // Fallback fuzzy match in case of minor variations
+  if (s.includes("pro cricket")) return "Online";
+  if (s.includes("kaziranga")) return "In-Store";
+  return "Unknown";
+}
+
+// Convert 0-based column index to Excel-style letter (0->A, 1->B, ..., 25->Z, 26->AA)
+function colLetter(idx) {
+  if (idx < 0) return "?";
+  let s = "";
+  let n = idx;
+  while (n >= 0) {
+    s = String.fromCharCode(65 + (n % 26)) + s;
+    n = Math.floor(n / 26) - 1;
+  }
+  return s;
+}
+
 function parseCSV(text) {
-  const lines = text.trim().split("\n").filter(Boolean);
+  // Normalise Windows (\r\n) and old Mac (\r) line endings to \n before splitting,
+  // otherwise a trailing \r sticks to the last column on every row (e.g. Channel becomes
+  // 'Kaziranga Outfitters\r') and silently breaks exact-match comparisons.
+  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim().split("\n").filter(Boolean);
   if (lines.length < 2) return { error: "CSV appears empty." };
 
-  const header = lines[0].split(",").map(h => h.trim().toLowerCase());
+  const header = splitCSVRow(lines[0]).map(h => h.trim().toLowerCase());
   const col = (name) => header.findIndex(h => h.includes(name));
 
   const idxDate    = col("date");
-  const idxCost    = col("item cost");
+  const idxCost    = col("cost of good"); // updated column name
   const idxNet     = col("net sales");
   const idxProfit  = col("net profit");
   const idxGross   = col("gross sales");
@@ -97,8 +163,9 @@ function parseCSV(text) {
   const idxQty     = col("qty");
   const idxTax     = col("tax");
   const idxCust    = col("customer");
-  const idxRepeat  = col("repeat");
-  const idxChannel = col("sales channel");
+  const idxRepeat  = col("returning customer"); // updated column name
+  const idxChannel = col("channel");
+  const idxEvent   = col("event type"); // Payment vs Return
 
   if (idxDate === -1) return { error: "Couldn't find a Date column." };
 
@@ -107,11 +174,31 @@ function parseCSV(text) {
   const itemRows = [];
   const dateErrors = [];
   const dateWarnings = [];
+  const unknownChannels = new Set();
+  const blankCostItems = [];
+  const missingValues = []; // critical fields missing — blocks import
+
+  // Columns that must NOT be blank. Maps column-index -> human-readable label.
+  // Customer Name is deliberately allowed to be blank (walk-in customers with no name captured).
+  const REQUIRED_FIELDS = [
+    { idx: idxDate,    label: "Date" },
+    { idx: idxCat,     label: "Category" },
+    { idx: idxItem,    label: "Item" },
+    { idx: idxQty,     label: "Qty" },
+    { idx: idxCost,    label: "Cost of Good" },
+    { idx: idxGross,   label: "Gross Sales" },
+    { idx: idxNet,     label: "Net Sales" },
+    { idx: idxTax,     label: "Tax" },
+    { idx: idxProfit,  label: "Net Profit After Tax" },
+    { idx: idxEvent,   label: "Event Type" },
+    { idx: idxRepeat,  label: "Returning Customer" },
+    { idx: idxChannel, label: "Channel" },
+  ];
 
   for (let i = 1; i < lines.length; i++) {
-    // Handle commas inside quoted fields
-    const cols = lines[i].match(/(".*?"|[^,]+|(?<=,)(?=,)|(?<=,)$|^(?=,))/g) || lines[i].split(",");
-    const get = (idx) => idx >= 0 ? (cols[idx] || "").replace(/^"|"$/g, "").trim() : "";
+    // Properly handle quoted fields (commas inside quotes, escaped "" quotes, etc.)
+    const cols = splitCSVRow(lines[i]);
+    const get = (idx) => idx >= 0 ? (cols[idx] || "").replace(/\r/g, "").trim() : "";
 
     const rawDate = get(idxDate);
     const { date, warning: dateWarning } = parseDate(rawDate);
@@ -123,25 +210,53 @@ function parseCSV(text) {
       dateWarnings.push(dateWarning);
     }
 
-    const cost   = parseMoney(get(idxCost));
-    const net    = parseMoney(get(idxNet));
-    const profit = parseMoney(get(idxProfit));
-    const gross  = parseMoney(get(idxGross));
-    const tax    = parseMoney(get(idxTax));
+    // Check every required field for blank values BEFORE parsing.
+    // Use spreadsheet-style cell refs (e.g. "F12") so the DBA can locate them quickly.
+    const csvRowNum = i + 1; // +1 because i=1 corresponds to spreadsheet row 2 (header is row 1)
+    for (const field of REQUIRED_FIELDS) {
+      if (field.idx === -1) continue; // column not present in CSV — separate concern
+      const v = (cols[field.idx] || "").replace(/\r/g, "").trim();
+      if (v === "") {
+        missingValues.push({
+          row: csvRowNum,
+          cell: colLetter(field.idx) + csvRowNum,
+          field: field.label,
+          itemContext: (cols[idxItem] || "").replace(/\r/g, "").trim() || "(unknown item)",
+          dateContext: (cols[idxDate] || "").replace(/\r/g, "").trim() || "(no date)"
+        });
+      }
+    }
+
+    const rawCost = get(idxCost);
+    const costIsBlank = rawCost === "" || rawCost === null || rawCost === undefined;
+    let cost   = parseMoney(rawCost);
+    let net    = parseMoney(get(idxNet));
+    let profit = parseMoney(get(idxProfit));
+    let gross  = parseMoney(get(idxGross));
+    let tax    = parseMoney(get(idxTax));
+
+    // Event Type: Payment (default) or Return/Refund.
+    // Square already encodes returns with negative Gross/Net/Tax/Profit values in the export,
+    // so no sign-flipping is needed here — summing them naturally deducts from the day's totals.
+    // Cost of Good on a return row is reported as a positive number in Square's export even though
+    // the row represents a deduction, so cost must be negated to correctly reduce total cost too.
+    const rawEvent = get(idxEvent).toLowerCase();
+    const isReturn = rawEvent.includes("return") || rawEvent.includes("refund");
+    if (isReturn && cost > 0) {
+      cost = -cost;
+    }
 
     if (!byDate[date]) byDate[date] = { revenue: 0, cost: 0, profit: 0, tax: 0, items: [] };
     byDate[date].revenue += net;
     byDate[date].cost    += cost;
     byDate[date].profit  += profit;
     byDate[date].tax     += tax;
-    const rawChannel = get(idxChannel).toLowerCase();
-    const channel = rawChannel.includes("online") || rawChannel.includes("web") || rawChannel.includes("e-commerce")
-      ? "Online"
-      : rawChannel.includes("store") || rawChannel.includes("walk") || rawChannel.includes("in-store")
-      ? "In-Store"
-      : idxChannel === -1 ? "Unknown" : "Unknown";
 
-    byDate[date].items.push({
+    const rawChannel = get(idxChannel);
+    const channel = normaliseChannel(rawChannel);
+    if (channel === "Unknown" && rawChannel) unknownChannels.add(rawChannel);
+
+    const itemRecord = {
       item:     get(idxItem),
       category: get(idxCat),
       qty:      get(idxQty),
@@ -149,9 +264,12 @@ function parseCSV(text) {
       customer: get(idxCust),
       repeat:   get(idxRepeat),
       channel,
-    });
-
-    itemRows.push({ date, item: get(idxItem), category: get(idxCat), gross, net, cost, profit, tax, customer: get(idxCust), channel });
+      isReturn,
+      costIsBlank,
+    };
+    byDate[date].items.push(itemRecord);
+    itemRows.push({ date, ...itemRecord });
+    if (costIsBlank) blankCostItems.push({ date, item: get(idxItem), row: i });
   }
 
   if (Object.keys(byDate).length === 0) {
@@ -160,7 +278,7 @@ function parseCSV(text) {
       : "No valid rows found. Check date format — required: MM/DD/YYYY.";
     return { error: errMsg };
   }
-  return { byDate, itemRows, dateErrors, dateWarnings };
+  return { byDate, itemRows, dateErrors, dateWarnings, unknownChannels: Array.from(unknownChannels), blankCostItems, missingValues };
 }
 
 const SEED = {};
@@ -234,6 +352,7 @@ export default function App() {
   };
 
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [clearStep, setClearStep] = useState(0); // 0 = idle, 1 = first confirm, 2 = final confirm
   const [reportDate, setReportDate] = useState(TODAY);
   const deleteBulkOrder = (id) => {
     setBulkOrders(prev => prev.filter(o => o.id !== id));
@@ -676,11 +795,12 @@ export default function App() {
                   <div style={{ color: G.muted, fontSize: 12, marginTop: 3 }}>{importPreview.itemRows.length} line items across {Object.keys(importPreview.byDate).length} day(s)</div>
                 </div>
                 {(() => {
-                  const hasDupes    = Object.keys(importPreview.byDate).some(d => entries[d]);
-                  const hasDayFlag  = Object.keys(importPreview.byDate).some(d => [0,1].includes(new Date(d + "T00:00:00").getDay()));
-                  const hasDateErr  = importPreview.dateErrors && importPreview.dateErrors.length > 0;
-                  const hasDateWarn = importPreview.dateWarnings && importPreview.dateWarnings.length > 0;
-                  const blocked     = hasDateErr || hasDateWarn || hasDayFlag;
+                  const hasDupes      = Object.keys(importPreview.byDate).some(d => entries[d]);
+                  const hasDayFlag    = Object.keys(importPreview.byDate).some(d => [0,1].includes(new Date(d + "T00:00:00").getDay()));
+                  const hasDateErr    = importPreview.dateErrors && importPreview.dateErrors.length > 0;
+                  const hasDateWarn   = importPreview.dateWarnings && importPreview.dateWarnings.length > 0;
+                  const hasMissing    = importPreview.missingValues && importPreview.missingValues.length > 0;
+                  const blocked       = hasDateErr || hasDateWarn || hasDayFlag || hasMissing;
                   // Show normal import button only when nothing blocks it
                   if (!blocked && !hasDupes) {
                     return (
@@ -704,7 +824,7 @@ export default function App() {
                         <strong>{Object.keys(importPreview.byDate).filter(d => entries[d]).join(", ")}</strong> already exist in your dashboard.
                         Do you want to replace the existing data with this file?
                       </div>
-                      {!(importPreview.dateErrors && importPreview.dateErrors.length > 0) && !(importPreview.dateWarnings && importPreview.dateWarnings.length > 0) && (
+                      {!(importPreview.dateErrors && importPreview.dateErrors.length > 0) && !(importPreview.dateWarnings && importPreview.dateWarnings.length > 0) && !(importPreview.missingValues && importPreview.missingValues.length > 0) && (
                         <div style={{ display: "flex", gap: 10 }}>
                           <button onClick={confirmImport} style={{
                             padding: "8px 20px", background: "#D97706", color: "#fff", border: "none",
@@ -716,8 +836,8 @@ export default function App() {
                           }}>✕ Cancel, keep existing</button>
                         </div>
                       )}
-                      {(importPreview.dateErrors && importPreview.dateErrors.length > 0 || importPreview.dateWarnings && importPreview.dateWarnings.length > 0) && (
-                        <div style={{ fontSize: 12, color: "#92400E", fontWeight: 600 }}>🚫 Fix date format errors above before importing.</div>
+                      {(importPreview.dateErrors && importPreview.dateErrors.length > 0 || importPreview.dateWarnings && importPreview.dateWarnings.length > 0 || importPreview.missingValues && importPreview.missingValues.length > 0) && (
+                        <div style={{ fontSize: 12, color: "#92400E", fontWeight: 600 }}>🚫 Fix errors above before importing.</div>
                       )}
                     </div>
                   </div>
@@ -762,6 +882,95 @@ export default function App() {
                       <div style={{ fontSize: 12 }}>
                         🚫 <strong>Import blocked.</strong> Ask your DBA to fix the date column to <strong>MM/DD/YYYY</strong> and re-send the file.
                       </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Missing values — HARD BLOCK */}
+              {importPreview.missingValues && importPreview.missingValues.length > 0 && (() => {
+                // Group by field for a cleaner summary, but also show individual cells.
+                const byField = {};
+                importPreview.missingValues.forEach(m => {
+                  if (!byField[m.field]) byField[m.field] = [];
+                  byField[m.field].push(m);
+                });
+                return (
+                  <div style={{ background: "#FEF2F2", border: "1px solid #DC2626", borderRadius: 10, padding: "14px 16px", marginBottom: 16, fontSize: 13, color: "#7F1D1D" }}>
+                    <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+                      <span style={{ fontSize: 20 }}>🚫</span>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 14 }}>Import blocked — {importPreview.missingValues.length} missing value{importPreview.missingValues.length !== 1 ? "s" : ""} found</div>
+                        <div style={{ marginBottom: 12 }}>
+                          The CSV has blank values in required columns. Ask your DBA to fill in the cells below and re-send the file.
+                          Cell references are in spreadsheet format — open the CSV in Excel/Sheets and go directly to each cell.
+                        </div>
+
+                        {/* Summary by field */}
+                        <div style={{ background: "#FEE2E2", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>
+                          <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 12 }}>Summary by column:</div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                            {Object.entries(byField).map(([field, items]) => (
+                              <div key={field} style={{ fontSize: 12 }}>
+                                <strong>{field}:</strong> {items.length} blank cell{items.length !== 1 ? "s" : ""}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Cell-level detail */}
+                        <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6, color: "#7F1D1D" }}>Individual missing cells (first 50):</div>
+                        <div style={{ maxHeight: 220, overflowY: "auto", background: "#fff", border: "1px solid #FECACA", borderRadius: 6 }}>
+                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                            <thead style={{ position: "sticky", top: 0, background: "#FEE2E2" }}>
+                              <tr>
+                                {["Cell","CSV Row","Date","Item","Missing Field"].map(h => (
+                                  <th key={h} style={{ padding: "5px 8px", textAlign: "left", color: "#7F1D1D", fontWeight: 700 }}>{h}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {importPreview.missingValues.slice(0, 50).map((m, i) => (
+                                <tr key={i} style={{ borderTop: "1px solid #FECACA" }}>
+                                  <td style={{ padding: "4px 8px", fontFamily: "monospace", fontWeight: 700, color: "#DC2626" }}>{m.cell}</td>
+                                  <td style={{ padding: "4px 8px", color: G.muted }}>{m.row}</td>
+                                  <td style={{ padding: "4px 8px" }}>{m.dateContext}</td>
+                                  <td style={{ padding: "4px 8px", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={m.itemContext}>{m.itemContext}</td>
+                                  <td style={{ padding: "4px 8px", fontWeight: 600 }}>{m.field}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        {importPreview.missingValues.length > 50 && (
+                          <div style={{ fontSize: 11, color: "#9A1C1C", marginTop: 6 }}>...and {importPreview.missingValues.length - 50} more missing cells not shown</div>
+                        )}
+
+                        <div style={{ marginTop: 12, padding: "8px 12px", background: "#FECACA", borderRadius: 6, fontSize: 12 }}>
+                          <strong>🚫 Import is blocked.</strong> Once your DBA fixes these cells, re-export and try again.
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Unknown channel warning */}
+              {importPreview.unknownChannels && importPreview.unknownChannels.length > 0 && (
+                <div style={{ background: "#FFF7ED", border: "1px solid #F97316", borderRadius: 10, padding: "14px 16px", marginBottom: 16, fontSize: 13, color: "#7C2D12" }}>
+                  <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+                    <span style={{ fontSize: 20 }}>❓</span>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: 700, marginBottom: 6 }}>Unrecognised Channel value{importPreview.unknownChannels.length > 1 ? "s" : ""}</div>
+                      <div style={{ marginBottom: 10 }}>
+                        Expected <strong>"Kaziranga Outfitters"</strong> (In-Store) or <strong>"Kaziranga Pro Cricket Outfitters"</strong> (Online), but found:
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+                        {importPreview.unknownChannels.map((c, i) => (
+                          <div key={i} style={{ background: "#FFEDD5", borderRadius: 6, padding: "4px 10px", fontSize: 12 }}>❓ "{c}"</div>
+                        ))}
+                      </div>
+                      <div style={{ fontSize: 12 }}>These rows will import but show as "Unknown" channel — they won't count toward In-Store or Online totals. Ask your DBA to verify the Channel column.</div>
                     </div>
                   </div>
                 </div>
@@ -830,22 +1039,41 @@ export default function App() {
                     <span>Cost: {fmt(data.cost)}</span>
                     <span style={{ color: data.profit >= 0 ? G.goldL : "#FCA5A5" }}>Profit: {fmt(data.profit)}</span>
                     <span>Tax: {fmt(data.tax)}</span>
+                    {data.items.filter(i => i.isReturn).length > 0 && (
+                      <span style={{ color: "#FCA5A5" }}>↩ {data.items.filter(i => i.isReturn).length} Return{data.items.filter(i => i.isReturn).length > 1 ? "s" : ""}</span>
+                    )}
                   </div>
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                     <thead>
                       <tr style={{ background: "#F3F4F6" }}>
-                        {["Item","Category","Net Sales","Cost","Profit","Customer",""].map(h => (
+                        {["Event","Item","Category","Channel","Net Sales","Cost","Profit","Customer",""].map(h => (
                           <th key={h} style={{ padding: "6px 10px", textAlign: "left", color: G.muted, fontWeight: 600 }}>{h}</th>
                         ))}
                       </tr>
                     </thead>
                     <tbody>
                       {data.items.map((item, i) => (
-                        <tr key={i} style={{ borderBottom: "1px solid #F0F0F0" }}>
-                          <td style={{ padding: "7px 10px", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={item.item}>{item.item}</td>
+                        <tr key={i} style={{ borderBottom: "1px solid #F0F0F0", background: item.isReturn ? "#FEF2F2" : "transparent" }}>
+                          <td style={{ padding: "7px 10px" }}>
+                            {item.isReturn ? (
+                              <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 8, background: "#FEE2E2", color: G.red }}>↩ Return</span>
+                            ) : (
+                              <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 8, background: "#D1FAE5", color: G.mid }}>✓ Payment</span>
+                            )}
+                          </td>
+                          <td style={{ padding: "7px 10px", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={item.item}>{item.item}</td>
                           <td style={{ padding: "7px 10px", color: G.muted }}>{item.category}</td>
-                          <td style={{ padding: "7px 10px" }}>{fmt(item.net)}</td>
-                          <td style={{ padding: "7px 10px", color: G.muted }}>{fmt(item.cost)}</td>
+                          <td style={{ padding: "7px 10px" }}>
+                            {item.channel && item.channel !== "Unknown" ? (
+                              <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 8, background: item.channel === "Online" ? "#DBEAFE" : "#D1FAE5", color: item.channel === "Online" ? "#1D4ED8" : G.mid }}>
+                                {item.channel === "Online" ? "🌐" : "🏪"} {item.channel}
+                              </span>
+                            ) : <span style={{ color: G.muted, fontSize: 11 }}>❓ Unknown</span>}
+                          </td>
+                          <td style={{ padding: "7px 10px", color: item.net < 0 ? G.red : G.ink }}>{fmt(item.net)}</td>
+                          <td style={{ padding: "7px 10px", color: item.costIsBlank ? "#D97706" : G.muted }}>
+                            {item.costIsBlank ? <span title="Cost of Good was blank in the CSV">⚠️ $0.00</span> : fmt(item.cost)}
+                          </td>
                           <td style={{ padding: "7px 10px", fontWeight: 600, color: item.profit >= 0 ? G.mid : G.red }}>{fmt(item.profit)}</td>
                           <td style={{ padding: "7px 10px", color: G.muted }}>{item.customer}</td>
                           <td style={{ padding: "7px 10px" }}>
@@ -870,7 +1098,7 @@ export default function App() {
 
           {!importPreview && (
             <div style={{ color: G.muted, fontSize: 13, textAlign: "center", marginTop: 8 }}>
-              Expected columns: Date (MM/DD/YYYY), Item, Category, Qty, Item Cost, Gross Sales, Discounts, Net Sales, Tax, Net Profit After Tax, Customer Name
+              Expected columns: Date (MM/DD/YYYY), Category, Item, Qty, Price Point Name, Cost of Good, Gross Sales, Discounts, Net Sales, Tax, Net Profit After Tax, Event Type (Payment/Return), Customer Name, Returning Customer, Channel
             </div>
           )}
 
@@ -882,18 +1110,46 @@ export default function App() {
                 <div style={{ fontWeight: 700, color: "#7F1D1D", fontSize: 13, marginBottom: 4 }}>Clear All Dashboard Data</div>
                 <div style={{ color: "#9A3412", fontSize: 12 }}>Permanently deletes all imported sales data. This cannot be undone.</div>
               </div>
-              <button onClick={() => {
-                const first = window.confirm("Are you sure you want to delete ALL data? This cannot be undone.");
-                if (!first) return;
-                const second = window.confirm("Final confirmation — this will permanently erase all your sales history. Continue?");
-                if (!second) return;
-                try { localStorage.removeItem(STORAGE_KEY); } catch {}
-                window.location.reload();
-              }} style={{
-                padding: "9px 20px", background: "#fff", color: "#DC2626",
-                border: "2px solid #DC2626", borderRadius: 8,
-                fontWeight: 700, cursor: "pointer", fontSize: 13, whiteSpace: "nowrap"
-              }}>🗑 Clear All Data</button>
+              {clearStep === 0 && (
+                <button onClick={() => setClearStep(1)} style={{
+                  padding: "9px 20px", background: "#fff", color: "#DC2626",
+                  border: "2px solid #DC2626", borderRadius: 8,
+                  fontWeight: 700, cursor: "pointer", fontSize: 13, whiteSpace: "nowrap"
+                }}>🗑 Clear All Data</button>
+              )}
+              {clearStep === 1 && (
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 12, color: "#7F1D1D", fontWeight: 700 }}>Delete all data?</span>
+                  <button onClick={() => setClearStep(2)} style={{
+                    padding: "7px 14px", background: "#DC2626", color: "#fff", border: "none",
+                    borderRadius: 6, fontWeight: 700, cursor: "pointer", fontSize: 12
+                  }}>Yes, continue</button>
+                  <button onClick={() => setClearStep(0)} style={{
+                    padding: "7px 14px", background: "#fff", color: G.muted, border: "1px solid #E0E0E0",
+                    borderRadius: 6, cursor: "pointer", fontSize: 12, fontWeight: 600
+                  }}>Cancel</button>
+                </div>
+              )}
+              {clearStep === 2 && (
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 12, color: "#7F1D1D", fontWeight: 700 }}>⚠️ Final confirmation — this cannot be undone:</span>
+                  <button onClick={() => {
+                    try { localStorage.removeItem(STORAGE_KEY); } catch {}
+                    setEntries(SEED);
+                    setBulkOrders([]);
+                    try { localStorage.removeItem("kaz_bulk_v1"); } catch {}
+                    setClearStep(0);
+                    showToast("All data cleared");
+                  }} style={{
+                    padding: "7px 14px", background: "#DC2626", color: "#fff", border: "none",
+                    borderRadius: 6, fontWeight: 700, cursor: "pointer", fontSize: 12
+                  }}>🗑 Delete Everything</button>
+                  <button onClick={() => setClearStep(0)} style={{
+                    padding: "7px 14px", background: "#fff", color: G.muted, border: "1px solid #E0E0E0",
+                    borderRadius: 6, cursor: "pointer", fontSize: 12, fontWeight: 600
+                  }}>Cancel</button>
+                </div>
+              )}
             </div>
           </div>
 
@@ -1774,7 +2030,9 @@ export default function App() {
                                 <td style={{ padding: "6px 10px" }}>{fmt(item.gross)}</td>
                                 <td style={{ padding: "6px 10px", color: G.red }}>{item.gross - item.net > 0 ? "-" + fmt(item.gross - item.net) : "—"}</td>
                                 <td style={{ padding: "6px 10px", color: G.mid }}>{fmt(item.net)}</td>
-                                <td style={{ padding: "6px 10px", color: G.muted }}>{fmt(item.cost)}</td>
+                                <td style={{ padding: "6px 10px", color: item.costIsBlank ? "#D97706" : G.muted }}>
+                                  {item.costIsBlank ? <span title="Cost of Good was blank in the CSV">⚠️ $0.00</span> : fmt(item.cost)}
+                                </td>
                                 <td style={{ padding: "6px 10px", color: "#92400E" }}>{fmt(item.tax)}</td>
                                 <td style={{ padding: "6px 10px", fontWeight: 700, color: item.profit >= 0 ? G.mid : G.red }}>{fmt(item.profit)}</td>
                                 <td style={{ padding: "6px 10px", color: G.muted }}>
@@ -2240,7 +2498,9 @@ export default function App() {
                                     <td style={{ padding: "5px 10px", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={item.item}>{item.item}</td>
                                     <td style={{ padding: "5px 10px", color: G.muted }}>{item.category}</td>
                                     <td style={{ padding: "5px 10px" }}>{fmt(item.net)}</td>
-                                    <td style={{ padding: "5px 10px", color: G.muted }}>{fmt(item.cost)}</td>
+                                    <td style={{ padding: "5px 10px", color: item.costIsBlank ? "#D97706" : G.muted }}>
+                                      {item.costIsBlank ? <span title="Cost of Good was blank in the CSV">⚠️ $0.00</span> : fmt(item.cost)}
+                                    </td>
                                     <td style={{ padding: "5px 10px", fontWeight: 600, color: item.profit >= 0 ? G.mid : G.red }}>{fmt(item.profit)}</td>
                                     <td style={{ padding: "5px 10px" }}>
                                       {item.channel && item.channel !== "Unknown" && (
