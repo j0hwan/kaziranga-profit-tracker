@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef, Fragment } from "react";
+import { loadCloudData, saveDailyEntries, saveBulkOrders, saveGoalAmount } from "./lib/cloudData";
 import { BarChart, Bar, Cell, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 
 const G = {
@@ -298,6 +299,8 @@ export default function App() {
   const [activeTab, setActiveTab]   = useState("dashboard");
   const [expandedDate, setExpandedDate] = useState(null);
   const fileRef = useRef();
+  const [cloudReady, setCloudReady] = useState(false);
+  const didLoadCloud = useRef(false);
 
   // ── Bulk orders ──────────────────────────────────────────────
   const [bulkOrders, setBulkOrders] = useState(() => {
@@ -580,6 +583,77 @@ export default function App() {
     }
     setEditingGoal(false);
   };
+  // ── Supabase cloud load/save ───────────────────────────────────
+useEffect(() => {
+  let cancelled = false;
+
+  async function run() {
+    try {
+      const data = await loadCloudData();
+
+      if (cancelled) return;
+
+      setEntries(data.entries);
+      setBulkOrders(data.bulkOrders);
+      setGoalAmount(data.goalAmount);
+
+      didLoadCloud.current = true;
+      setCloudReady(true);
+    } catch (err) {
+      console.error("Cloud load failed:", err);
+
+      didLoadCloud.current = true;
+      setCloudReady(true);
+
+      showToast("Could not load cloud data. Check Supabase connection.", false);
+    }
+  }
+
+  run();
+
+  return () => {
+    cancelled = true;
+  };
+}, []);
+
+useEffect(() => {
+  if (!cloudReady || !didLoadCloud.current) return;
+
+  const timeout = setTimeout(() => {
+    saveDailyEntries(entries).catch((err) => {
+      console.error("Daily entries cloud save failed:", err);
+      showToast("Could not save daily entries to cloud.", false);
+    });
+  }, 700);
+
+  return () => clearTimeout(timeout);
+}, [entries, cloudReady]);
+
+useEffect(() => {
+  if (!cloudReady || !didLoadCloud.current) return;
+
+  const timeout = setTimeout(() => {
+    saveBulkOrders(bulkOrders).catch((err) => {
+      console.error("Bulk orders cloud save failed:", err);
+      showToast("Could not save bulk orders to cloud.", false);
+    });
+  }, 700);
+
+  return () => clearTimeout(timeout);
+}, [bulkOrders, cloudReady]);
+
+useEffect(() => {
+  if (!cloudReady || !didLoadCloud.current) return;
+
+  const timeout = setTimeout(() => {
+    saveGoalAmount(goalAmount).catch((err) => {
+      console.error("Goal cloud save failed:", err);
+      showToast("Could not save goal to cloud.", false);
+    });
+  }, 700);
+
+  return () => clearTimeout(timeout);
+}, [goalAmount, cloudReady]);
 
   // ── Best selling items (all-time by profit) ──────────────────
   const topItems = useMemo(() => {
@@ -713,6 +787,24 @@ export default function App() {
   }, [dailyRows]);
 
   // ── Render ───────────────────────────────────────────────────
+
+if (!cloudReady) {
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: G.cream,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      color: G.dark,
+      fontFamily: "'Segoe UI', system-ui, sans-serif",
+      fontWeight: 800,
+    }}>
+      Loading your saved dashboard...
+    </div>
+  );
+}
+
   return (
     <div style={{ minHeight: "100vh", background: G.cream, fontFamily: "'Segoe UI', system-ui, sans-serif", color: G.ink }}>
 
