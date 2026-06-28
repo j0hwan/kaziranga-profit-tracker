@@ -48,17 +48,16 @@ function parseDate(raw) {
   const m1 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (m1) {
     const mm = parseInt(m1[1]), dd = parseInt(m1[2]), yyyy = m1[3];
-    // Detect likely Indian format DD/MM/YYYY:
-    // If month part > 12, it must be a day → wrong format
+    // Only block clearly wrong: month part > 12 means it's DD/MM/YYYY (Indian format).
     if (mm > 12) {
       return { date: null, warning: `"${s}" looks like DD/MM/YYYY (Indian format). Required format is MM/DD/YYYY. Did you mean ${m1[2].padStart(2,"0")}/${m1[1].padStart(2,"0")}/${yyyy}?` };
     }
-    // If day part > 12 and month part <= 12, it's unambiguous MM/DD — fine
-    // If both parts <= 12, it's ambiguous — warn
-    const ambiguous = mm <= 12 && dd <= 12 && mm !== dd;
+    // Day > 12 with valid month = unambiguous MM/DD.
+    // Both <= 12 = technically ambiguous, but per DBA instructions we trust MM/DD/YYYY.
+    // No warning issued — the format is authoritative.
     return {
       date: `${yyyy}-${m1[1].padStart(2,"0")}-${m1[2].padStart(2,"0")}`,
-      warning: ambiguous ? `"${s}" is ambiguous — could be MM/DD or DD/MM. Assuming MM/DD/YYYY (US format). If this is wrong, ask your DBA to use MM/DD/YYYY explicitly.` : null
+      warning: null
     };
   }
 
@@ -583,77 +582,79 @@ export default function App() {
     }
     setEditingGoal(false);
   };
+
+
   // ── Supabase cloud load/save ───────────────────────────────────
-useEffect(() => {
-  let cancelled = false;
+  useEffect(() => {
+    let cancelled = false;
 
-  async function run() {
-    try {
-      const data = await loadCloudData();
+    async function run() {
+      try {
+        const data = await loadCloudData();
 
-      if (cancelled) return;
+        if (cancelled) return;
 
-      setEntries(data.entries);
-      setBulkOrders(data.bulkOrders);
-      setGoalAmount(data.goalAmount);
+        setEntries(data.entries);
+        setBulkOrders(data.bulkOrders);
+        setGoalAmount(data.goalAmount);
 
-      didLoadCloud.current = true;
-      setCloudReady(true);
-    } catch (err) {
-      console.error("Cloud load failed:", err);
+        didLoadCloud.current = true;
+        setCloudReady(true);
+      } catch (err) {
+        console.error("Cloud load failed:", err);
 
-      didLoadCloud.current = true;
-      setCloudReady(true);
+        didLoadCloud.current = true;
+        setCloudReady(true);
 
-      showToast("Could not load cloud data. Check Supabase connection.", false);
+        showToast("Could not load cloud data. Check Supabase connection.", false);
+      }
     }
-  }
 
-  run();
+    run();
 
-  return () => {
-    cancelled = true;
-  };
-}, []);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-useEffect(() => {
-  if (!cloudReady || !didLoadCloud.current) return;
+  useEffect(() => {
+    if (!cloudReady || !didLoadCloud.current) return;
 
-  const timeout = setTimeout(() => {
-    saveDailyEntries(entries).catch((err) => {
-      console.error("Daily entries cloud save failed:", err);
-      showToast("Could not save daily entries to cloud.", false);
-    });
-  }, 700);
+    const timeout = setTimeout(() => {
+      saveDailyEntries(entries).catch((err) => {
+        console.error("Daily entries cloud save failed:", err);
+        showToast("Could not save daily entries to cloud.", false);
+      });
+    }, 700);
 
-  return () => clearTimeout(timeout);
-}, [entries, cloudReady]);
+    return () => clearTimeout(timeout);
+  }, [entries, cloudReady]);
 
-useEffect(() => {
-  if (!cloudReady || !didLoadCloud.current) return;
+  useEffect(() => {
+    if (!cloudReady || !didLoadCloud.current) return;
 
-  const timeout = setTimeout(() => {
-    saveBulkOrders(bulkOrders).catch((err) => {
-      console.error("Bulk orders cloud save failed:", err);
-      showToast("Could not save bulk orders to cloud.", false);
-    });
-  }, 700);
+    const timeout = setTimeout(() => {
+      saveBulkOrders(bulkOrders).catch((err) => {
+        console.error("Bulk orders cloud save failed:", err);
+        showToast("Could not save bulk orders to cloud.", false);
+      });
+    }, 700);
 
-  return () => clearTimeout(timeout);
-}, [bulkOrders, cloudReady]);
+    return () => clearTimeout(timeout);
+  }, [bulkOrders, cloudReady]);
 
-useEffect(() => {
-  if (!cloudReady || !didLoadCloud.current) return;
+  useEffect(() => {
+    if (!cloudReady || !didLoadCloud.current) return;
 
-  const timeout = setTimeout(() => {
-    saveGoalAmount(goalAmount).catch((err) => {
-      console.error("Goal cloud save failed:", err);
-      showToast("Could not save goal to cloud.", false);
-    });
-  }, 700);
+    const timeout = setTimeout(() => {
+      saveGoalAmount(goalAmount).catch((err) => {
+        console.error("Goal cloud save failed:", err);
+        showToast("Could not save goal to cloud.", false);
+      });
+    }, 700);
 
-  return () => clearTimeout(timeout);
-}, [goalAmount, cloudReady]);
+    return () => clearTimeout(timeout);
+  }, [goalAmount, cloudReady]);
 
   // ── Best selling items (all-time by profit) ──────────────────
   const topItems = useMemo(() => {
@@ -788,22 +789,22 @@ useEffect(() => {
 
   // ── Render ───────────────────────────────────────────────────
 
-if (!cloudReady) {
-  return (
-    <div style={{
-      minHeight: "100vh",
-      background: G.cream,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      color: G.dark,
-      fontFamily: "'Segoe UI', system-ui, sans-serif",
-      fontWeight: 800,
-    }}>
-      Loading your saved dashboard...
-    </div>
-  );
-}
+  if (!cloudReady) {
+    return (
+      <div style={{
+        minHeight: "100vh",
+        background: G.cream,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        color: G.dark,
+        fontFamily: "'Segoe UI', system-ui, sans-serif",
+        fontWeight: 800,
+      }}>
+        Loading your saved dashboard...
+      </div>
+    );
+  }
 
   return (
     <div style={{ minHeight: "100vh", background: G.cream, fontFamily: "'Segoe UI', system-ui, sans-serif", color: G.ink }}>
@@ -892,6 +893,8 @@ if (!cloudReady) {
                   const hasDateErr    = importPreview.dateErrors && importPreview.dateErrors.length > 0;
                   const hasDateWarn   = importPreview.dateWarnings && importPreview.dateWarnings.length > 0;
                   const hasMissing    = importPreview.missingValues && importPreview.missingValues.length > 0;
+                  // Missing values are a soft flag — handled in its own banner with its own Import Anyway button.
+                  // Date errors and Sunday/Monday flags are also handled by their own banners.
                   const blocked       = hasDateErr || hasDateWarn || hasDayFlag || hasMissing;
                   // Show normal import button only when nothing blocks it
                   if (!blocked && !hasDupes) {
@@ -988,18 +991,19 @@ if (!cloudReady) {
                   byField[m.field].push(m);
                 });
                 return (
-                  <div style={{ background: "#FEF2F2", border: "1px solid #DC2626", borderRadius: 10, padding: "14px 16px", marginBottom: 16, fontSize: 13, color: "#7F1D1D" }}>
+                  <div style={{ background: "#FFF7ED", border: "1px solid #F59E0B", borderRadius: 10, padding: "14px 16px", marginBottom: 16, fontSize: 13, color: "#7C2D12" }}>
                     <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-                      <span style={{ fontSize: 20 }}>🚫</span>
+                      <span style={{ fontSize: 20 }}>⚠️</span>
                       <div style={{ flex: 1 }}>
-                        <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 14 }}>Import blocked — {importPreview.missingValues.length} missing value{importPreview.missingValues.length !== 1 ? "s" : ""} found</div>
+                        <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 14 }}>{importPreview.missingValues.length} missing value{importPreview.missingValues.length !== 1 ? "s" : ""} found</div>
                         <div style={{ marginBottom: 12 }}>
-                          The CSV has blank values in required columns. Ask your DBA to fill in the cells below and re-send the file.
+                          The CSV has blank values in required columns. You can still import — but profit calculations for these rows may be inaccurate.
+                          Ideally, ask your DBA to fill in the cells below and re-send the file.
                           Cell references are in spreadsheet format — open the CSV in Excel/Sheets and go directly to each cell.
                         </div>
 
                         {/* Summary by field */}
-                        <div style={{ background: "#FEE2E2", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>
+                        <div style={{ background: "#FEF3C7", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>
                           <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 12 }}>Summary by column:</div>
                           <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                             {Object.entries(byField).map(([field, items]) => (
@@ -1011,20 +1015,20 @@ if (!cloudReady) {
                         </div>
 
                         {/* Cell-level detail */}
-                        <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6, color: "#7F1D1D" }}>Individual missing cells (first 50):</div>
-                        <div style={{ maxHeight: 220, overflowY: "auto", background: "#fff", border: "1px solid #FECACA", borderRadius: 6 }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6, color: "#7C2D12" }}>Individual missing cells (first 50):</div>
+                        <div style={{ maxHeight: 220, overflowY: "auto", background: "#fff", border: "1px solid #FDE68A", borderRadius: 6 }}>
                           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
-                            <thead style={{ position: "sticky", top: 0, background: "#FEE2E2" }}>
+                            <thead style={{ position: "sticky", top: 0, background: "#FEF3C7" }}>
                               <tr>
                                 {["Cell","CSV Row","Date","Item","Missing Field"].map(h => (
-                                  <th key={h} style={{ padding: "5px 8px", textAlign: "left", color: "#7F1D1D", fontWeight: 700 }}>{h}</th>
+                                  <th key={h} style={{ padding: "5px 8px", textAlign: "left", color: "#7C2D12", fontWeight: 700 }}>{h}</th>
                                 ))}
                               </tr>
                             </thead>
                             <tbody>
                               {importPreview.missingValues.slice(0, 50).map((m, i) => (
-                                <tr key={i} style={{ borderTop: "1px solid #FECACA" }}>
-                                  <td style={{ padding: "4px 8px", fontFamily: "monospace", fontWeight: 700, color: "#DC2626" }}>{m.cell}</td>
+                                <tr key={i} style={{ borderTop: "1px solid #FDE68A" }}>
+                                  <td style={{ padding: "4px 8px", fontFamily: "monospace", fontWeight: 700, color: "#D97706" }}>{m.cell}</td>
                                   <td style={{ padding: "4px 8px", color: G.muted }}>{m.row}</td>
                                   <td style={{ padding: "4px 8px" }}>{m.dateContext}</td>
                                   <td style={{ padding: "4px 8px", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={m.itemContext}>{m.itemContext}</td>
@@ -1035,11 +1039,18 @@ if (!cloudReady) {
                           </table>
                         </div>
                         {importPreview.missingValues.length > 50 && (
-                          <div style={{ fontSize: 11, color: "#9A1C1C", marginTop: 6 }}>...and {importPreview.missingValues.length - 50} more missing cells not shown</div>
+                          <div style={{ fontSize: 11, color: "#92400E", marginTop: 6 }}>...and {importPreview.missingValues.length - 50} more missing cells not shown</div>
                         )}
 
-                        <div style={{ marginTop: 12, padding: "8px 12px", background: "#FECACA", borderRadius: 6, fontSize: 12 }}>
-                          <strong>🚫 Import is blocked.</strong> Once your DBA fixes these cells, re-export and try again.
+                        <div style={{ marginTop: 14, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                          <button onClick={confirmImport} style={{
+                            padding: "8px 18px", background: "#D97706", color: "#fff", border: "none",
+                            borderRadius: 8, fontWeight: 700, cursor: "pointer", fontSize: 13
+                          }}>⚠️ Import Anyway</button>
+                          <button onClick={() => { setImportPreview(null); setActiveTab("import"); }} style={{
+                            padding: "8px 18px", background: "#fff", color: "#92400E",
+                            border: "1px solid #F59E0B", borderRadius: 8, fontWeight: 700, cursor: "pointer", fontSize: 13
+                          }}>✕ Cancel & Re-check</button>
                         </div>
                       </div>
                     </div>
