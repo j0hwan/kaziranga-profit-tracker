@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, Fragment } from "react";
-import { loadCloudData, saveDailyEntries, saveBulkOrders, saveGoalAmount, uploadCsvImport } from "./lib/cloudData";
+import { loadCloudData, saveDailyEntries, saveBulkOrders, saveGoalAmount, uploadCsvImport, loadCsvImportHistory } from "./lib/cloudData";
 import { BarChart, Bar, Cell, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 
 const G = {
@@ -295,9 +295,12 @@ export default function App() {
   const [activeMonth, setActiveMonth] = useState(getMonthKey(TODAY));
   const [toast, setToast]           = useState(null);
   const [importPreview, setImportPreview] = useState(null);
-  const [activeTab, setActiveTab]   = useState("dashboard");
-  const [expandedDate, setExpandedDate] = useState(null);
-  const fileRef = useRef();
+const [importHistory, setImportHistory] = useState([]);
+const [historyDateFilter, setHistoryDateFilter] = useState("");
+const [historyLoading, setHistoryLoading] = useState(false);
+const [activeTab, setActiveTab]   = useState("dashboard");
+const [expandedDate, setExpandedDate] = useState(null);
+const fileRef = useRef();
   const [cloudReady, setCloudReady] = useState(false);
   const didLoadCloud = useRef(false);
 
@@ -427,7 +430,7 @@ export default function App() {
     showToast(msg);
 
 try {
-  await uploadCsvImport(importPreview.fileName, importPreview.csvText, {
+  const savedImport = await uploadCsvImport(importPreview.fileName, importPreview.csvText, {
     itemCount: importPreview.itemRows.length,
     dayCount: dates.length,
     dates,
@@ -435,6 +438,8 @@ try {
     totalProfit: dates.reduce((sum, date) => sum + (importPreview.byDate[date]?.profit || 0), 0),
     replacedDays: replaced,
   });
+
+  setImportHistory(prev => [savedImport, ...prev]);
 
   showToast("CSV file archived to Supabase Storage ✓");
 } catch (err) {
@@ -604,6 +609,36 @@ setActiveTab("dashboard");
     setEditingGoal(false);
   };
 
+  // ── CSV import history ───────────────────────────────────────
+  useEffect(() => {
+    if (!cloudReady) return;
+
+    let cancelled = false;
+
+    async function run() {
+      try {
+        setHistoryLoading(true);
+        const rows = await loadCsvImportHistory();
+
+        if (!cancelled) {
+          setImportHistory(rows);
+        }
+      } catch (err) {
+        console.error("Import history load failed:", err);
+        showToast("Could not load import history.", false);
+      } finally {
+        if (!cancelled) {
+          setHistoryLoading(false);
+        }
+      }
+    }
+
+    run();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [cloudReady]);
 
   // ── Supabase cloud load/save ───────────────────────────────────
   useEffect(() => {
@@ -1225,6 +1260,103 @@ setActiveTab("dashboard");
               Expected columns: Date (MM/DD/YYYY), Category, Item, Qty, Price Point Name, Cost of Good, Gross Sales, Discounts, Net Sales, Tax, Net Profit After Tax, Event Type (Payment/Return), Customer Name, Returning Customer, Channel
             </div>
           )}
+
+          {/* Import History */}
+          <div style={{ marginTop: 36, background: G.card, borderRadius: 14, padding: "20px 22px", boxShadow: "0 1px 6px #0001" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16, flexWrap: "wrap", marginBottom: 16 }}>
+              <div>
+                <div style={{ fontWeight: 700, color: G.dark, fontSize: 15 }}>📜 Import History</div>
+                <div style={{ color: G.muted, fontSize: 12, marginTop: 3 }}>
+                  See uploaded CSV files saved to Supabase Storage.
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <span style={{ fontSize: 12, fontWeight: 700, color: G.dark }}>Filter by upload date:</span>
+                <input
+                  type="date"
+                  value={historyDateFilter}
+                  onChange={e => setHistoryDateFilter(e.target.value)}
+                  style={{ padding: "6px 9px", borderRadius: 8, border: `1px solid ${G.mid}`, fontSize: 12, color: G.dark, outline: "none" }}
+                />
+                {historyDateFilter && (
+                  <button
+                    onClick={() => setHistoryDateFilter("")}
+                    style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid #E5E7EB", background: "#fff", color: G.muted, fontSize: 12, cursor: "pointer", fontWeight: 600 }}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {historyLoading ? (
+              <div style={{ color: G.muted, fontSize: 13, padding: "14px 0" }}>Loading import history...</div>
+            ) : (() => {
+              const toDateInput = (iso) => {
+                const d = new Date(iso);
+                return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+              };
+
+              const filteredHistory = historyDateFilter
+                ? importHistory.filter(row => toDateInput(row.imported_at) === historyDateFilter)
+                : importHistory;
+
+              if (filteredHistory.length === 0) {
+                return (
+                  <div style={{ textAlign: "center", color: G.muted, fontSize: 13, padding: "24px 0", background: "#F9FBFA", borderRadius: 10 }}>
+                    {historyDateFilter ? "No CSV imports found for this date." : "No CSV import history yet. Import a CSV to see it here."}
+                  </div>
+                );
+              }
+
+              return (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                    <thead>
+                      <tr style={{ background: G.dark, color: G.goldL }}>
+                        {["Uploaded","File","Rows","Days","Revenue","Profit","Replaced","Stored Path"].map(h => (
+                          <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontWeight: 600, whiteSpace: "nowrap" }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredHistory.map((row, i) => {
+                        const summary = row.summary || {};
+                        return (
+                          <tr key={row.id} style={{ background: i % 2 === 0 ? "#F9FBFA" : G.card, borderBottom: "1px solid #F0F0F0" }}>
+                            <td style={{ padding: "8px 10px", whiteSpace: "nowrap", color: G.dark, fontWeight: 600 }}>
+                              {new Date(row.imported_at).toLocaleString("en-US", {
+                                month: "short",
+                                day: "numeric",
+                                year: "numeric",
+                                hour: "numeric",
+                                minute: "2-digit",
+                              })}
+                            </td>
+                            <td style={{ padding: "8px 10px", maxWidth: 190, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }} title={row.file_name}>
+                              {row.file_name}
+                            </td>
+                            <td style={{ padding: "8px 10px", color: G.muted }}>{summary.itemCount ?? "—"}</td>
+                            <td style={{ padding: "8px 10px", color: G.muted }}>{summary.dayCount ?? "—"}</td>
+                            <td style={{ padding: "8px 10px", color: G.mid, fontWeight: 700 }}>{fmt(summary.totalRevenue || 0)}</td>
+                            <td style={{ padding: "8px 10px", color: (summary.totalProfit || 0) >= 0 ? G.mid : G.red, fontWeight: 700 }}>{fmt(summary.totalProfit || 0)}</td>
+                            <td style={{ padding: "8px 10px", color: (summary.replacedDays || 0) > 0 ? "#D97706" : G.muted, fontWeight: 600 }}>
+                              {summary.replacedDays || 0}
+                            </td>
+                            <td style={{ padding: "8px 10px", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: G.muted, fontFamily: "monospace", fontSize: 11 }} title={row.storage_path}>
+                              {row.storage_path}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            })()}
+          </div>
+
 
           {/* Danger zone — clear all data */}
           <div style={{ marginTop: 48, borderTop: "1px dashed #E0E0E0", paddingTop: 24 }}>
