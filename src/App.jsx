@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, Fragment } from "react";
-import { loadCloudData, saveDailyEntries, saveBulkOrders, saveGoalAmount } from "./lib/cloudData";
+import { loadCloudData, saveDailyEntries, saveBulkOrders, saveGoalAmount, uploadCsvImport } from "./lib/cloudData";
 import { BarChart, Bar, Cell, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 
 const G = {
@@ -398,14 +398,18 @@ export default function App() {
     reader.onload = (ev) => {
       const result = parseCSV(ev.target.result);
       if (result.error) { showToast(result.error, false); return; }
-      setImportPreview({ ...result, fileName: file.name });
+      setImportPreview({
+       ...result,
+       fileName: file.name,
+  csvText: ev.target.result,
+});
       setActiveTab("import");
     };
     reader.readAsText(file);
     e.target.value = "";
   };
 
-  const confirmImport = () => {
+  const confirmImport = async () => {
     if (!importPreview) return;
     const dates = Object.keys(importPreview.byDate);
     const replaced = dates.filter(d => entries[d]).length;
@@ -421,8 +425,25 @@ export default function App() {
       ? `Imported ${importPreview.itemRows.length} items — ${replaced} day(s) replaced with fresh data ✓`
       : `Imported ${importPreview.itemRows.length} items across ${dates.length} day(s) ✓`;
     showToast(msg);
-    setImportPreview(null);
-    setActiveTab("dashboard");
+
+try {
+  await uploadCsvImport(importPreview.fileName, importPreview.csvText, {
+    itemCount: importPreview.itemRows.length,
+    dayCount: dates.length,
+    dates,
+    totalRevenue: dates.reduce((sum, date) => sum + (importPreview.byDate[date]?.revenue || 0), 0),
+    totalProfit: dates.reduce((sum, date) => sum + (importPreview.byDate[date]?.profit || 0), 0),
+    replacedDays: replaced,
+  });
+
+  showToast("CSV file archived to Supabase Storage ✓");
+} catch (err) {
+  console.error("CSV archive failed:", err);
+  showToast("Dashboard imported, but CSV file archive failed.", false);
+}
+
+setImportPreview(null);
+setActiveTab("dashboard");
     // Jump to the most recent imported month
     const latest = dates.sort().pop();
     if (latest) setActiveMonth(getMonthKey(latest));

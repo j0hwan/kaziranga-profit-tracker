@@ -163,3 +163,41 @@ export async function saveGoalAmount(goalAmount) {
 
   if (result.error) throw result.error;
 }
+
+export async function uploadCsvImport(fileName, csvText, summary = {}) {
+  const user = await getCurrentUser();
+
+  const safeFileName = String(fileName || "import.csv")
+    .replace(/[^a-zA-Z0-9._-]/g, "_");
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const storagePath = `${user.id}/${timestamp}-${safeFileName}`;
+
+  const fileBlob = new Blob([csvText], {
+    type: "text/csv;charset=utf-8",
+  });
+
+  const uploadResult = await supabase.storage
+    .from("csv-files")
+    .upload(storagePath, fileBlob, {
+      contentType: "text/csv",
+      upsert: false,
+    });
+
+  if (uploadResult.error) throw uploadResult.error;
+
+  const insertResult = await supabase
+    .from("csv_imports")
+    .insert({
+      user_id: user.id,
+      file_name: fileName || "import.csv",
+      storage_path: storagePath,
+      summary,
+    })
+    .select()
+    .single();
+
+  if (insertResult.error) throw insertResult.error;
+
+  return insertResult.data;
+}
