@@ -201,3 +201,33 @@ export async function uploadCsvImport(fileName, csvText, summary = {}) {
 
   return insertResult.data;
 }
+
+export async function loadCsvImportHistory() {
+  const user = await getCurrentUser();
+
+  const result = await supabase
+    .from("csv_imports")
+    .select("id, file_name, storage_path, imported_at, summary")
+    .eq("user_id", user.id)
+    .order("imported_at", { ascending: false });
+
+  if (result.error) throw result.error;
+
+  return result.data || [];
+}
+
+export async function downloadCsvImport(storagePath) {
+  const user = await getCurrentUser();
+
+  if (!storagePath || !String(storagePath).startsWith(`${user.id}/`)) {
+    throw new Error("You do not have access to this CSV file.");
+  }
+
+  const result = await supabase.storage
+    .from("csv-files")
+    .download(storagePath);
+
+  if (result.error) throw result.error;
+
+  return await result.data.text();
+}

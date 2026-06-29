@@ -1,6 +1,5 @@
 import { useState, useEffect, useMemo, useRef, Fragment } from "react";
-import { loadCloudData, saveDailyEntries, saveBulkOrders, saveGoalAmount, uploadCsvImport, loadCsvImportHistory } from "./lib/cloudData";
-import { supabase } from "./lib/supabaseClient";
+import { loadCloudData, saveDailyEntries, saveBulkOrders, saveGoalAmount, uploadCsvImport, loadCsvImportHistory, downloadCsvImport } from "./lib/cloudData";
 import { BarChart, Bar, Cell, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 
 const G = {
@@ -318,128 +317,6 @@ function parseCSV(text) {
 
 const SEED = {};
 const STORAGE_KEY = "kaz_profit_v5";
-const GUEST_MODE_KEY = "kaz_guest_mode_v1";
-const GUEST_CSV_HISTORY_KEY = "kaz_guest_csv_history_v1";
-
-function makeId(prefix = "id") {
-  if (typeof window !== "undefined" && window.crypto && window.crypto.randomUUID) {
-    return window.crypto.randomUUID();
-  }
-  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function blankManualItem() {
-  return {
-    id: makeId("manual-item"),
-    itemType: "",
-    brand: "",
-    qty: "1",
-    revenue: "",
-    cost: "",
-    details: "",
-  };
-}
-
-function parseCsvForSpreadsheet(text) {
-  const lines = String(text || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .filter(line => line.trim() !== "");
-
-  if (lines.length === 0) return { headers: [], rows: [] };
-
-  const headers = splitCSVRow(lines[0]).map((h, i) => h.trim() || `Column ${i + 1}`);
-  const rows = lines.slice(1).map(line => {
-    const cells = splitCSVRow(line);
-    const row = {};
-    headers.forEach((h, i) => { row[h] = cells[i] ?? ""; });
-    return row;
-  });
-
-  return { headers, rows };
-}
-
-function compactItemPreview(items, max = 3) {
-  const names = (items || [])
-    .map(item => item.itemType || item.item || item.name || item.category || "Item")
-    .filter(Boolean);
-
-  if (names.length === 0) return "No item details";
-  const shown = names.slice(0, max).join(", ");
-  return names.length > max ? `${shown} +${names.length - max} more` : shown;
-}
-
-function rebuildManualEntriesForDate(date, data = {}) {
-  const items = Array.isArray(data.items) ? data.items : [];
-  const savedManualEntries = Array.isArray(data.manualEntries) ? data.manualEntries : [];
-  const usedIds = new Set();
-
-  const normalizeEntry = (entry) => {
-    const entryItems = Array.isArray(entry.items) && entry.items.length > 0
-      ? entry.items
-      : items.filter(item => item && item.isManual && item.manualEntryId === entry.id);
-
-    const revenue = entry.revenue ?? entryItems.reduce((sum, item) => sum + (item.revenue ?? item.net ?? 0), 0);
-    const cost = entry.cost ?? entryItems.reduce((sum, item) => sum + (item.cost || 0), 0);
-    const profit = entry.profit ?? (revenue - cost);
-
-    return {
-      ...entry,
-      date: entry.date || date,
-      createdAt: entry.createdAt || entryItems[0]?.manualCreatedAt || "",
-      type: entry.type || "Manual entry",
-      revenue,
-      cost,
-      profit,
-      details: entry.details || entryItems[0]?.manualDetails || entryItems[0]?.details || "",
-      itemType: entry.itemType || entryItems[0]?.itemType || entryItems[0]?.item || "Manual entry",
-      brand: entry.brand || entryItems[0]?.brand || "",
-      items: entryItems,
-    };
-  };
-
-  const rows = [];
-
-  savedManualEntries.forEach(entry => {
-    if (!entry) return;
-    if (entry.id) usedIds.add(entry.id);
-    rows.push(normalizeEntry(entry));
-  });
-
-  const grouped = {};
-
-  items
-    .filter(item => item && item.isManual && item.manualEntryId && !usedIds.has(item.manualEntryId))
-    .forEach(item => {
-      const id = item.manualEntryId;
-
-      if (!grouped[id]) {
-        grouped[id] = {
-          id,
-          date,
-          createdAt: item.manualCreatedAt || "",
-          revenue: 0,
-          cost: 0,
-          profit: 0,
-          details: item.manualDetails || item.details || "",
-          type: "Manual entry",
-          itemType: item.itemType || item.item || "Manual entry",
-          brand: item.brand || "",
-          items: [],
-        };
-      }
-
-      grouped[id].items.push(item);
-      grouped[id].revenue += item.revenue ?? item.net ?? 0;
-      grouped[id].cost += item.cost || 0;
-      grouped[id].profit += item.profit || ((item.revenue ?? item.net ?? 0) - (item.cost || 0));
-    });
-
-  Object.values(grouped).forEach(entry => rows.push(normalizeEntry(entry)));
-
-  return rows;
-}
 
 export default function App() {
   const [entries, setEntries] = useState(() => {
@@ -448,27 +325,20 @@ export default function App() {
       return stored ? JSON.parse(stored) : SEED;
     } catch { return SEED; }
   });
-  const [form, setForm] = useState({ date: TODAY, details: "" });
-  const [manualItems, setManualItems] = useState(() => [blankManualItem()]);
+  const [form, setForm]             = useState({ date: TODAY, revenue: "", cost: "", itemType: "", brand: "", details: "" });
   const [activeMonth, setActiveMonth] = useState(getMonthKey(TODAY));
-  const [toast, setToast] = useState(null);
-  const [importPreview, setImportPreview] = useState(null);
-  const [importHistory, setImportHistory] = useState([]);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [showHistoryDashboard, setShowHistoryDashboard] = useState(false);
-  const [selectedHistoryDate, setSelectedHistoryDate] = useState("");
-  const [calendarMonth, setCalendarMonth] = useState(getMonthKey(TODAY));
-  const [historyIndicatorMode, setHistoryIndicatorMode] = useState("all");
-  const [showManualEntries, setShowManualEntries] = useState(false);
-  const [spreadsheetView, setSpreadsheetView] = useState(null);
-  const [spreadsheetLoading, setSpreadsheetLoading] = useState(false);
-  const [guestMode, setGuestMode] = useState(() => {
-    try { return localStorage.getItem(GUEST_MODE_KEY) === "1"; } catch { return false; }
-  });
-  const [cloudError, setCloudError] = useState("");
-  const [activeTab, setActiveTab] = useState("dashboard");
-  const [expandedDate, setExpandedDate] = useState(null);
-  const fileRef = useRef();
+const [toast, setToast]           = useState(null);
+const [importPreview, setImportPreview] = useState(null);
+const [importHistory, setImportHistory] = useState([]);
+const [historyLoading, setHistoryLoading] = useState(false);
+const [showHistoryDashboard, setShowHistoryDashboard] = useState(false);
+const [selectedHistoryDate, setSelectedHistoryDate] = useState("");
+const [calendarMonth, setCalendarMonth] = useState(getMonthKey(TODAY));
+const [historyIndicatorMode, setHistoryIndicatorMode] = useState("all");
+const [showManualEntries, setShowManualEntries] = useState(false);
+const [activeTab, setActiveTab]   = useState("dashboard");
+const [expandedDate, setExpandedDate] = useState(null);
+const fileRef = useRef();
   const [cloudReady, setCloudReady] = useState(false);
   const didLoadCloud = useRef(false);
 
@@ -561,133 +431,6 @@ export default function App() {
     setTimeout(() => setToast(null), 3000);
   };
 
-  const startGuestMode = () => {
-    try { localStorage.setItem(GUEST_MODE_KEY, "1"); } catch {}
-    setGuestMode(true);
-    setCloudError("");
-    setCloudReady(true);
-    didLoadCloud.current = true;
-    showToast("Guest mode enabled — data stays on this browser only ✓");
-  };
-
-  const leaveGuestMode = () => {
-    if (!window.confirm("Leave Guest Mode and try cloud login again? Guest data will stay saved in this browser.")) return;
-    try { localStorage.removeItem(GUEST_MODE_KEY); } catch {}
-    setGuestMode(false);
-    setCloudError("");
-    setCloudReady(false);
-    didLoadCloud.current = false;
-  };
-
-  const saveGuestImportHistory = (rows) => {
-    try { localStorage.setItem(GUEST_CSV_HISTORY_KEY, JSON.stringify(rows)); } catch {}
-  };
-
-  const openSpreadsheet = ({ title, subtitle = "", headers = [], rows = [] }) => {
-    setSpreadsheetView({ title, subtitle, headers, rows });
-  };
-
-  const openCsvSpreadsheet = async (row) => {
-    try {
-      setSpreadsheetLoading(true);
-      let csvText = row.csvText || row.raw_csv || "";
-
-      if (!csvText && row.storage_path) {
-        const { data, error } = await supabase.auth.getUser();
-        if (error) throw error;
-        const user = data.user;
-        if (!user) throw new Error("You must be logged in to view this saved CSV.");
-        if (!String(row.storage_path).startsWith(`${user.id}/`)) {
-          throw new Error("You do not have access to this CSV file.");
-        }
-
-        const downloadResult = await supabase.storage
-          .from("csv-files")
-          .download(row.storage_path);
-
-        if (downloadResult.error) throw downloadResult.error;
-        csvText = await downloadResult.data.text();
-      }
-
-      if (!csvText) {
-        showToast("This CSV file could not be opened. Older history may only have summary data.", false);
-        return;
-      }
-
-      const parsed = parseCsvForSpreadsheet(csvText);
-      openSpreadsheet({
-        title: row.file_name || "CSV Import",
-        subtitle: row.imported_at
-          ? `Uploaded ${new Date(row.imported_at).toLocaleString()}`
-          : "Guest/local CSV import",
-        headers: parsed.headers,
-        rows: parsed.rows,
-      });
-    } catch (err) {
-      console.error("CSV spreadsheet open failed:", err);
-      showToast(err.message || "Could not open CSV spreadsheet.", false);
-    } finally {
-      setSpreadsheetLoading(false);
-    }
-  };
-
-  const openManualSpreadsheet = (entry) => {
-    const rows = (entry.items || []).map((item, index) => ({
-      "#": index + 1,
-      "Date": entry.date,
-      "Time Added": entry.createdAt ? new Date(entry.createdAt).toLocaleString() : "Older entry",
-      "Item / Type": item.itemType || item.item || "Manual item",
-      "Brand": item.brand || "",
-      "Qty": item.qty || 1,
-      "Revenue": fmt(item.revenue || item.net || 0),
-      "Cost": fmt(item.cost || 0),
-      "Profit": fmt(item.profit || 0),
-      "Details": item.details || entry.details || "",
-    }));
-
-    openSpreadsheet({
-      title: `Manual Entry — ${entry.date}`,
-      subtitle: `${fmt(entry.revenue || 0)} revenue · ${fmt(entry.cost || 0)} cost · ${fmt(entry.profit || 0)} profit`,
-      headers: ["#", "Date", "Time Added", "Item / Type", "Brand", "Qty", "Revenue", "Cost", "Profit", "Details"],
-      rows,
-    });
-  };
-
-  const openAllManualSpreadsheet = () => {
-    const rows = manualEntriesAll.flatMap(entry => {
-      const itemRows = (entry.items && entry.items.length > 0) ? entry.items : [{
-        itemType: entry.itemType || entry.type || "Manual entry",
-        brand: entry.brand || "",
-        qty: 1,
-        revenue: entry.revenue || 0,
-        cost: entry.cost || 0,
-        profit: entry.profit || 0,
-        details: entry.details || "",
-      }];
-
-      return itemRows.map((item, itemIndex) => ({
-        "Entry ID": entry.id,
-        "Date": entry.date,
-        "Time Added": entry.createdAt ? new Date(entry.createdAt).toLocaleString() : "Older entry",
-        "Entry Count": itemIndex === 0 ? "1 entry" : "same entry",
-        "Item / Type": item.itemType || item.item || "Manual item",
-        "Brand": item.brand || "",
-        "Qty": item.qty || 1,
-        "Revenue": fmt(item.revenue || item.net || 0),
-        "Cost": fmt(item.cost || 0),
-        "Profit": fmt(item.profit || 0),
-        "Details": item.details || entry.details || "",
-      }));
-    });
-
-    openSpreadsheet({
-      title: "All Manual Entries",
-      subtitle: `${manualEntriesAll.length} manual entr${manualEntriesAll.length === 1 ? "y" : "ies"}. Multiple items inside one entry still count as one entry.`,
-      headers: ["Entry ID", "Date", "Time Added", "Entry Count", "Item / Type", "Brand", "Qty", "Revenue", "Cost", "Profit", "Details"],
-      rows,
-    });
-  };
-
   // ── CSV import ──────────────────────────────────────────────
   const handleFile = (e) => {
     const file = e.target.files[0];
@@ -714,23 +457,19 @@ export default function App() {
     setEntries(prev => {
       const next = { ...prev };
       Object.entries(importPreview.byDate).forEach(([date, data]) => {
-        // Always overwrite CSV data, but preserve manual entries even after a cloud reload.
+        // Always overwrite CSV data, but preserve separate manual-entry history for that date.
         const existing = next[date] || {};
-        const manualEntries = rebuildManualEntriesForDate(date, existing);
-
+        const manualEntries = existing.manualEntries || [];
         const manualRevenue = manualEntries.reduce((sum, entry) => sum + (entry.revenue || 0), 0);
         const manualCost = manualEntries.reduce((sum, entry) => sum + (entry.cost || 0), 0);
         const manualProfit = manualEntries.reduce((sum, entry) => sum + (entry.profit || 0), 0);
-        const manualItemRows = manualEntries.flatMap(entry => entry.items || []);
 
         next[date] = {
           ...data,
           revenue: (data.revenue || 0) + manualRevenue,
           cost: (data.cost || 0) + manualCost,
           profit: (data.profit || 0) + manualProfit,
-          items: [...manualItemRows, ...(data.items || [])],
           manualEntries,
-          noSale: false,
         };
       });
       return next;
@@ -740,42 +479,22 @@ export default function App() {
       : `Imported ${importPreview.itemRows.length} items across ${dates.length} day(s) ✓`;
     showToast(msg);
 
-const importSummary = {
+try {
+const savedImport = await uploadCsvImport(importPreview.fileName, importPreview.csvText, {
   itemCount: importPreview.itemRows.length,
   dayCount: dates.length,
   dates,
   totalRevenue: dates.reduce((sum, date) => sum + (importPreview.byDate[date]?.revenue || 0), 0),
   totalProfit: dates.reduce((sum, date) => sum + (importPreview.byDate[date]?.profit || 0), 0),
   replacedDays: replaced,
-};
+});
 
-if (guestMode || cloudError) {
-  const localImport = {
-    id: makeId("guest-csv"),
-    file_name: importPreview.fileName || "import.csv",
-    imported_at: new Date().toISOString(),
-    summary: importSummary,
-    csvText: importPreview.csvText,
-    storage_path: "",
-    guest: true,
-  };
+setImportHistory(prev => [savedImport, ...prev]);
 
-  setImportHistory(prev => {
-    const next = [localImport, ...prev];
-    saveGuestImportHistory(next);
-    return next;
-  });
-
-  showToast("CSV imported and saved locally in Guest Mode ✓");
-} else {
-  try {
-    const savedImport = await uploadCsvImport(importPreview.fileName, importPreview.csvText, importSummary);
-    setImportHistory(prev => [savedImport, ...prev]);
-    showToast("CSV file archived to Supabase Storage ✓");
-  } catch (err) {
-    console.error("CSV archive failed:", err);
-    showToast("Dashboard imported, but CSV file archive failed.", false);
-  }
+showToast("CSV file archived to Supabase Storage ✓");
+} catch (err) {
+  console.error("CSV archive failed:", err);
+  showToast("Dashboard imported, but CSV file archive failed.", false);
 }
 
 setImportPreview(null);
@@ -786,101 +505,33 @@ setActiveTab("dashboard");
   };
 
   // ── Manual save ─────────────────────────────────────────────
-  const updateManualItem = (id, patch) => {
-    setManualItems(prev => prev.map(item => item.id === id ? { ...item, ...patch } : item));
-  };
-
-  const addManualItemRow = () => {
-    setManualItems(prev => [...prev, blankManualItem()]);
-  };
-
-  const removeManualItemRow = (id) => {
-    setManualItems(prev => prev.length <= 1 ? prev : prev.filter(item => item.id !== id));
-  };
-
   const handleSave = () => {
-    if (!form.date) {
-      showToast("Pick a date first.", false);
+    if (!form.date || form.revenue === "" || form.cost === "") {
+      showToast("Fill in date, revenue, and cost.", false);
       return;
     }
 
-    const usableItems = manualItems
-      .map((item, index) => {
-        const revenue = parseFloat(item.revenue);
-        const cost = parseFloat(item.cost);
-        const qty = parseFloat(item.qty) || 1;
-        const hasContent = item.revenue !== "" || item.cost !== "" || item.itemType.trim() !== "" || item.brand.trim() !== "" || item.details.trim() !== "";
+    const rev = parseFloat(form.revenue);
+    const cost = parseFloat(form.cost);
 
-        return {
-          ...item,
-          hasContent,
-          itemType: item.itemType || `Manual item ${index + 1}`,
-          brand: item.brand || "",
-          details: item.details || "",
-          qty,
-          revenue: Number.isFinite(revenue) ? revenue : 0,
-          cost: Number.isFinite(cost) ? cost : 0,
-          profit: (Number.isFinite(revenue) ? revenue : 0) - (Number.isFinite(cost) ? cost : 0),
-        };
-      })
-      .filter(item => item.hasContent);
-
-    if (usableItems.length === 0) {
-      showToast("Add at least one manual item with revenue or cost.", false);
+    if (isNaN(rev) || isNaN(cost)) {
+      showToast("Enter valid revenue and cost numbers.", false);
       return;
     }
 
-    const hasBadMoney = manualItems.some(item => {
-      const hasContent = item.revenue !== "" || item.cost !== "" || item.itemType.trim() !== "" || item.brand.trim() !== "" || item.details.trim() !== "";
-      if (!hasContent) return false;
-      return item.revenue === "" || item.cost === "" || isNaN(parseFloat(item.revenue)) || isNaN(parseFloat(item.cost));
-    });
-
-    if (hasBadMoney) {
-      showToast("Every manual item needs valid revenue and cost numbers.", false);
-      return;
-    }
-
-    const entryId = makeId("manual-entry");
+    const profit = rev - cost;
     const createdAt = new Date().toISOString();
-    const revenue = usableItems.reduce((sum, item) => sum + item.revenue, 0);
-    const cost = usableItems.reduce((sum, item) => sum + item.cost, 0);
-    const profit = revenue - cost;
-
-    const entryItems = usableItems.map((item, index) => ({
-      item: item.itemType || `Manual item ${index + 1}`,
-      itemType: item.itemType || `Manual item ${index + 1}`,
-      category: item.itemType || "Manual Entry",
-      brand: item.brand || "",
-      qty: item.qty || 1,
-      gross: item.revenue,
-      net: item.revenue,
-      revenue: item.revenue,
-      cost: item.cost,
-      profit: item.profit,
-      tax: 0,
-      customer: "",
-      repeat: "",
-      channel: "Manual",
-      isManual: true,
-      manualEntryId: entryId,
-      manualCreatedAt: createdAt,
-      details: item.details || form.details || "",
-      manualDetails: form.details || "",
-    }));
-
     const manualEntry = {
-      id: entryId,
+      id: (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
       date: form.date,
       createdAt,
-      revenue,
+      revenue: rev,
       cost,
       profit,
+      itemType: form.itemType || "",
+      brand: form.brand || "",
       details: form.details || "",
       type: "Manual entry",
-      items: entryItems,
-      itemType: entryItems[0]?.itemType || "Manual entry",
-      brand: entryItems[0]?.brand || "",
     };
 
     setEntries(prev => {
@@ -900,21 +551,27 @@ setActiveTab("dashboard");
         ...prev,
         [form.date]: {
           ...existing,
-          revenue: (existing.revenue || 0) + revenue,
+          revenue: (existing.revenue || 0) + rev,
           cost: (existing.cost || 0) + cost,
           profit: existingProfit + profit,
           tax: existing.tax || 0,
-          items: [...entryItems, ...(existing.items || [])],
+          items: existing.items || [],
           manualEntries: [manualEntry, ...(existing.manualEntries || [])],
           noSale: false,
         },
       };
     });
 
-    setForm(prev => ({ ...prev, details: "" }));
-    setManualItems([blankManualItem()]);
+    setForm(prev => ({
+      ...prev,
+      revenue: "",
+      cost: "",
+      itemType: "",
+      brand: "",
+      details: "",
+    }));
 
-    showToast(`Manual entry saved with ${entryItems.length} item${entryItems.length !== 1 ? "s" : ""} for ${form.date} ✓`);
+    showToast(`Manual entry saved for ${form.date} ✓`);
   };
 
   const handleDelete = (date) => {
@@ -1063,20 +720,9 @@ setActiveTab("dashboard");
     setEditingGoal(false);
   };
 
-  // ── CSV import history load ───────────────────────────────────
+    // ── CSV import history load ───────────────────────────────────
   useEffect(() => {
     if (!cloudReady) return;
-
-    if (guestMode || cloudError) {
-      try {
-        const localRows = JSON.parse(localStorage.getItem(GUEST_CSV_HISTORY_KEY) || "[]");
-        setImportHistory(Array.isArray(localRows) ? localRows : []);
-      } catch {
-        setImportHistory([]);
-      }
-      setHistoryLoading(false);
-      return;
-    }
 
     let cancelled = false;
 
@@ -1103,21 +749,14 @@ setActiveTab("dashboard");
     return () => {
       cancelled = true;
     };
-  }, [cloudReady, guestMode, cloudError]);
+  }, [cloudReady]);
 
   // ── Supabase cloud load/save ───────────────────────────────────
   useEffect(() => {
     let cancelled = false;
 
     async function run() {
-      if (guestMode) {
-        didLoadCloud.current = true;
-        setCloudReady(true);
-        return;
-      }
-
       try {
-        setCloudError("");
         const data = await loadCloudData();
 
         if (cancelled) return;
@@ -1131,13 +770,10 @@ setActiveTab("dashboard");
       } catch (err) {
         console.error("Cloud load failed:", err);
 
-        if (cancelled) return;
-
-        setCloudError(err.message || "Could not load cloud data.");
         didLoadCloud.current = true;
         setCloudReady(true);
 
-        showToast("Cloud login unavailable. You can continue as Guest.", false);
+        showToast("Could not load cloud data. Check Supabase connection.", false);
       }
     }
 
@@ -1146,10 +782,10 @@ setActiveTab("dashboard");
     return () => {
       cancelled = true;
     };
-  }, [guestMode]);
+  }, []);
 
   useEffect(() => {
-    if (guestMode || cloudError || !cloudReady || !didLoadCloud.current) return;
+    if (!cloudReady || !didLoadCloud.current) return;
 
     const timeout = setTimeout(() => {
       saveDailyEntries(entries).catch((err) => {
@@ -1159,10 +795,10 @@ setActiveTab("dashboard");
     }, 700);
 
     return () => clearTimeout(timeout);
-  }, [entries, cloudReady, guestMode, cloudError]);
+  }, [entries, cloudReady]);
 
   useEffect(() => {
-    if (guestMode || cloudError || !cloudReady || !didLoadCloud.current) return;
+    if (!cloudReady || !didLoadCloud.current) return;
 
     const timeout = setTimeout(() => {
       saveBulkOrders(bulkOrders).catch((err) => {
@@ -1172,10 +808,10 @@ setActiveTab("dashboard");
     }, 700);
 
     return () => clearTimeout(timeout);
-  }, [bulkOrders, cloudReady, guestMode, cloudError]);
+  }, [bulkOrders, cloudReady]);
 
   useEffect(() => {
-    if (guestMode || cloudError || !cloudReady || !didLoadCloud.current) return;
+    if (!cloudReady || !didLoadCloud.current) return;
 
     const timeout = setTimeout(() => {
       saveGoalAmount(goalAmount).catch((err) => {
@@ -1185,7 +821,7 @@ setActiveTab("dashboard");
     }, 700);
 
     return () => clearTimeout(timeout);
-  }, [goalAmount, cloudReady, guestMode, cloudError]);
+  }, [goalAmount, cloudReady]);
 
   // ── Best selling items (all-time by profit) ──────────────────
   const topItems = useMemo(() => {
@@ -1346,54 +982,20 @@ setActiveTab("dashboard");
 
     Object.entries(entries).forEach(([date, data]) => {
       const savedManualEntries = data.manualEntries || [];
-      const items = data.items || [];
-      const usedIds = new Set();
 
       savedManualEntries.forEach(entry => {
-        usedIds.add(entry.id);
         rows.push({
           ...entry,
           date: entry.date || date,
           createdAt: entry.createdAt || "",
           type: entry.type || "Manual entry",
-          items: entry.items || items.filter(item => item.isManual && item.manualEntryId === entry.id),
         });
       });
 
-      // Rebuild manual entries from saved item rows. This keeps manual-entry history working
-      // even after Supabase reloads, because cloudData.js already stores the items array.
-      const grouped = {};
-      items
-        .filter(item => item && item.isManual && item.manualEntryId && !usedIds.has(item.manualEntryId))
-        .forEach(item => {
-          const id = item.manualEntryId;
-          if (!grouped[id]) {
-            grouped[id] = {
-              id,
-              date,
-              createdAt: item.manualCreatedAt || "",
-              revenue: 0,
-              cost: 0,
-              profit: 0,
-              details: item.manualDetails || item.details || "",
-              type: "Manual entry",
-              itemType: item.itemType || item.item || "Manual entry",
-              brand: item.brand || "",
-              items: [],
-            };
-          }
-
-          grouped[id].items.push(item);
-          grouped[id].revenue += item.revenue ?? item.net ?? 0;
-          grouped[id].cost += item.cost || 0;
-          grouped[id].profit += item.profit || ((item.revenue ?? item.net ?? 0) - (item.cost || 0));
-        });
-
-      Object.values(grouped).forEach(entry => rows.push(entry));
-
       // Backward compatibility: older manual entries were saved directly on the date,
       // before this app had individual manual-entry history.
-      if (savedManualEntries.length === 0 && Object.keys(grouped).length === 0 && items.length === 0 && !data.noSale && ((data.revenue || 0) !== 0 || (data.cost || 0) !== 0)) {
+      const items = data.items || [];
+      if (savedManualEntries.length === 0 && items.length === 0 && !data.noSale && ((data.revenue || 0) !== 0 || (data.cost || 0) !== 0)) {
         const profit = data.profit !== undefined && data.profit !== null
           ? data.profit
           : ((data.revenue || 0) - (data.cost || 0));
@@ -1410,17 +1012,6 @@ setActiveTab("dashboard");
           details: "Created before individual manual-entry history was added.",
           type: "Manual entry",
           legacy: true,
-          items: [{
-            itemType: "Older manual entry",
-            item: "Older manual entry",
-            brand: "",
-            qty: 1,
-            revenue: data.revenue || 0,
-            net: data.revenue || 0,
-            cost: data.cost || 0,
-            profit,
-            details: "Created before individual manual-entry history was added.",
-          }],
         });
       }
     });
@@ -1515,35 +1106,6 @@ setActiveTab("dashboard");
           ))}
         </div>
       </div>
-
-      {(guestMode || cloudError) && (
-        <div style={{
-          background: guestMode ? "#FFFBEB" : "#FEF2F2",
-          borderBottom: guestMode ? "1px solid #FDE68A" : "1px solid #FECACA",
-          padding: "10px 24px",
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          gap: 12,
-          flexWrap: "wrap",
-          fontSize: 12,
-        }}>
-          <div style={{ color: guestMode ? "#92400E" : "#7F1D1D", fontWeight: 800 }}>
-            {guestMode
-              ? "👤 Guest Mode: data is saved only in this browser/localStorage."
-              : `Cloud login unavailable: ${cloudError}`}
-          </div>
-          {guestMode ? (
-            <button onClick={leaveGuestMode} style={{ padding: "6px 12px", borderRadius: 999, border: "1px solid #F59E0B", background: "#fff", color: "#92400E", fontWeight: 800, cursor: "pointer", fontSize: 12 }}>
-              Try Cloud Login
-            </button>
-          ) : (
-            <button onClick={startGuestMode} style={{ padding: "6px 12px", borderRadius: 999, border: "none", background: G.dark, color: G.goldL, fontWeight: 900, cursor: "pointer", fontSize: 12 }}>
-              Continue as Guest
-            </button>
-          )}
-        </div>
-      )}
 
       {/* ── TIME RANGE BAR ── */}
       {activeTab !== "import" && (
@@ -1941,15 +1503,15 @@ setActiveTab("dashboard");
             }}>
               <div>
                 <div style={{ color: G.dark, fontWeight: 900, fontSize: 16 }}>
-                  🗓 Activity Calendar
+                  🗓 CSV Import Activity Calendar
                 </div>
                 <div style={{ color: G.muted, fontSize: 13, marginTop: 5 }}>
-                  Clean view of CSV uploads and manual entries by date.
+                  View uploaded CSV files and individual manual entries by date.
                 </div>
                 <div style={{ color: G.muted, fontSize: 12, marginTop: 8 }}>
                   {historyLoading
                     ? "Loading history..."
-                    : `${importHistory.length} CSV upload${importHistory.length !== 1 ? "s" : ""} · ${manualEntriesAll.length} manual entr${manualEntriesAll.length === 1 ? "y" : "ies"}`}
+                    : `${importHistory.length} CSV upload record${importHistory.length !== 1 ? "s" : ""} · ${manualEntriesAll.length} manual entr${manualEntriesAll.length === 1 ? "y" : "ies"}`}
                 </div>
               </div>
 
@@ -1981,59 +1543,74 @@ setActiveTab("dashboard");
             {showHistoryDashboard && (
               <div style={{
                 marginTop: 18,
-                background: "#F9FBFA",
-                borderRadius: 18,
-                border: "1px solid #E5F2EA",
-                padding: 16,
+                background: G.cream,
+                borderRadius: 20,
+                border: `1px solid ${G.gold}44`,
+                boxShadow: "inset 0 1px 0 #fff8",
+                overflow: "hidden",
               }}>
                 <div style={{
+                  background: G.dark,
+                  padding: "16px 20px",
                   display: "flex",
                   justifyContent: "space-between",
                   alignItems: "center",
-                  gap: 12,
-                  marginBottom: 14,
+                  gap: 16,
                   flexWrap: "wrap",
                 }}>
                   <div>
-                    <div style={{ color: G.dark, fontWeight: 900, fontSize: 15 }}>Activity Dashboard</div>
-                    <div style={{ color: G.muted, fontSize: 12, marginTop: 3 }}>
-                      Click a date, then click a CSV/manual card to open it like a spreadsheet.
+                    <div style={{ color: G.goldL, fontSize: 17, fontWeight: 900 }}>
+                      Activity Dashboard
+                    </div>
+                    <div style={{ color: "#A7B8AE", fontSize: 12, marginTop: 4 }}>
+                      Click a date to filter the left side. CSV uploads use 📄 and manual entries use +.
                     </div>
                   </div>
 
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                    {[
-                      { value: "all", label: "All" },
-                      { value: "files", label: "CSV" },
-                      { value: "manual", label: "Manual" },
-                    ].map(mode => (
-                      <button
-                        key={mode.value}
-                        onClick={() => setHistoryIndicatorMode(mode.value)}
-                        style={{
-                          padding: "6px 12px",
-                          borderRadius: 999,
-                          border: "1px solid #DDEBE3",
-                          background: historyIndicatorMode === mode.value ? G.dark : "#fff",
-                          color: historyIndicatorMode === mode.value ? G.goldL : G.muted,
-                          fontSize: 11,
-                          fontWeight: 900,
-                          cursor: "pointer",
-                        }}
-                      >
-                        {mode.label}
-                      </button>
-                    ))}
-                  </div>
+                  <button
+                    onClick={() => setShowHistoryDashboard(false)}
+                    style={{
+                      padding: "7px 13px",
+                      borderRadius: 999,
+                      border: "1px solid #ffffff22",
+                      background: "#ffffff11",
+                      color: G.goldL,
+                      cursor: "pointer",
+                      fontSize: 12,
+                      fontWeight: 900,
+                    }}
+                  >
+                    Close ▲
+                  </button>
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "0.9fr 1.35fr", gap: 16, alignItems: "start" }}>
-                  {/* Selected day / activity list */}
-                  <div style={{ background: G.card, borderRadius: 16, border: "1px solid #E5F2EA", padding: 16, minHeight: 460 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 12 }}>
+                <div style={{
+                  display: "grid",
+                  gridTemplateColumns: "0.95fr 1.25fr",
+                  gap: 18,
+                  padding: 18,
+                }}>
+                  {/* Left side activity list */}
+                  <div style={{
+                    background: G.card,
+                    borderRadius: 18,
+                    padding: 18,
+                    boxShadow: "0 2px 12px #0001",
+                    overflow: "hidden",
+                    display: "flex",
+                    flexDirection: "column",
+                    minHeight: 520,
+                  }}>
+                    <div style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "flex-start",
+                      gap: 12,
+                      marginBottom: 14,
+                    }}>
                       <div>
-                        <div style={{ color: G.dark, fontWeight: 900, fontSize: 14 }}>
-                          {selectedHistoryDate ? "Selected Day Activity" : "Recent CSV Uploads"}
+                        <div style={{ color: G.dark, fontWeight: 900, fontSize: 15 }}>
+                          {selectedHistoryDate ? "Selected Day Activity" : "All CSV Imports"}
                         </div>
                         <div style={{ color: G.muted, fontSize: 12, marginTop: 3 }}>
                           {selectedHistoryDate
@@ -2043,7 +1620,7 @@ setActiveTab("dashboard");
                                 day: "numeric",
                                 year: "numeric",
                               })
-                            : "Choose a date to see that day's CSVs and manual entries."}
+                            : "Scroll through every uploaded CSV file."}
                         </div>
                       </div>
 
@@ -2062,142 +1639,273 @@ setActiveTab("dashboard");
                             whiteSpace: "nowrap",
                           }}
                         >
-                          Show recent
+                          Show all
                         </button>
                       )}
                     </div>
 
-                    <div style={{ display: "flex", flexDirection: "column", gap: 10, maxHeight: 410, overflowY: "auto", paddingRight: 3 }}>
+                    <div style={{
+                      overflowY: "auto",
+                      maxHeight: 460,
+                      paddingRight: 4,
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 10,
+                    }}>
                       {selectedUploads.length === 0 && selectedManualEntries.length === 0 && (
                         <div style={{
                           background: "#F9FBFA",
                           borderRadius: 14,
-                          padding: "32px 18px",
+                          padding: "34px 18px",
                           textAlign: "center",
                           color: G.muted,
                           fontSize: 13,
-                          border: "1px dashed #DDEBE3",
                         }}>
-                          No activity found here.
+                          No activity found for this day.
                         </div>
                       )}
 
-                      {(historyIndicatorMode === "all" || historyIndicatorMode === "files") && selectedUploads.map(row => {
+                      {selectedUploads.map(row => {
                         const summary = row.summary || {};
+
                         return (
-                          <button
+                          <div
                             key={row.id}
-                            onClick={() => openCsvSpreadsheet(row)}
                             style={{
-                              textAlign: "left",
-                              background: "#F8FFFB",
-                              border: "1px solid #CFEEDD",
+                              background: "#F9FBFA",
+                              border: "1px solid #E5F2EA",
                               borderLeft: `5px solid ${G.mid}`,
                               borderRadius: 14,
                               padding: "13px 14px",
-                              cursor: "pointer",
                             }}
-                            title="Open CSV spreadsheet view"
-                          >
-                            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 8 }}>
-                              <div style={{ fontWeight: 900, color: G.dark, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                📄 {row.file_name || "CSV import"}
-                              </div>
-                              <div style={{ color: G.muted, fontSize: 11, whiteSpace: "nowrap", fontWeight: 700 }}>
-                                {row.imported_at
-                                  ? new Date(row.imported_at).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
-                                  : "Local"}
-                              </div>
-                            </div>
-
-                            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, fontSize: 12 }}>
-                              <div><div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>ROWS</div><div style={{ color: G.dark, fontWeight: 900 }}>{summary.itemCount ?? "—"}</div></div>
-                              <div><div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>REVENUE</div><div style={{ color: G.mid, fontWeight: 900 }}>{fmt(summary.totalRevenue || 0)}</div></div>
-                              <div><div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>PROFIT</div><div style={{ color: (summary.totalProfit || 0) >= 0 ? G.mid : G.red, fontWeight: 900 }}>{fmt(summary.totalProfit || 0)}</div></div>
-                            </div>
-
-                            <div style={{ marginTop: 8, color: G.muted, fontSize: 11, fontWeight: 700 }}>
-                              Click to view spreadsheet →
-                            </div>
-                          </button>
-                        );
-                      })}
-
-                      {selectedHistoryDate && (historyIndicatorMode === "all" || historyIndicatorMode === "manual") && selectedManualEntries.map((entry, i) => {
-                        const itemPreview = compactItemPreview(entry.items || [], 3);
-                        return (
-                          <button
-                            key={entry.id || `${selectedHistoryDate}-manual-${i}`}
-                            onClick={() => openManualSpreadsheet(entry)}
-                            style={{
-                              textAlign: "left",
-                              background: "#FFFBEB",
-                              border: "1px solid #FDE68A",
-                              borderLeft: `5px solid ${G.gold}`,
-                              borderRadius: 14,
-                              padding: "13px 14px",
-                              cursor: "pointer",
-                            }}
-                            title="Open manual entry spreadsheet view"
                           >
                             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 7 }}>
-                              <div style={{ color: G.dark, fontWeight: 900, fontSize: 13 }}>
-                                ➕ Manual Entry {i + 1}
+                              <div
+                                style={{
+                                  fontWeight: 900,
+                                  color: G.dark,
+                                  fontSize: 13,
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                }}
+                                title={row.file_name}
+                              >
+                                📄 {row.file_name}
                               </div>
-                              <div style={{ color: "#92400E", fontSize: 11, fontWeight: 800, whiteSpace: "nowrap" }}>
-                                {entry.createdAt ? new Date(entry.createdAt).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }) : selectedHistoryDate}
+
+                              <div style={{ color: G.muted, fontSize: 11, whiteSpace: "nowrap", fontWeight: 700 }}>
+                                {new Date(row.imported_at).toLocaleString("en-US", {
+                                  month: "short",
+                                  day: "numeric",
+                                  hour: "numeric",
+                                  minute: "2-digit",
+                                })}
                               </div>
                             </div>
 
-                            <div style={{ color: G.muted, fontSize: 11, marginBottom: 8 }}>
-                              <strong>Items:</strong> {itemPreview}
-                            </div>
-
-                            {entry.details && (
-                              <div style={{ color: G.muted, fontSize: 11, marginBottom: 8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                {entry.details}
+                            <div style={{
+                              display: "grid",
+                              gridTemplateColumns: "repeat(3, 1fr)",
+                              gap: 8,
+                              fontSize: 12,
+                            }}>
+                              <div>
+                                <div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>ROWS</div>
+                                <div style={{ color: G.dark, fontWeight: 900 }}>{summary.itemCount ?? "—"}</div>
                               </div>
-                            )}
 
-                            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, fontSize: 12 }}>
-                              <div><div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>ITEMS</div><div style={{ color: G.dark, fontWeight: 900 }}>{(entry.items || []).length || 1}</div></div>
-                              <div><div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>REVENUE</div><div style={{ color: G.mid, fontWeight: 900 }}>{fmt(entry.revenue || 0)}</div></div>
-                              <div><div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>PROFIT</div><div style={{ color: (entry.profit || 0) >= 0 ? G.mid : G.red, fontWeight: 900 }}>{fmt(entry.profit || 0)}</div></div>
-                            </div>
-
-                            {(entry.items || []).length > 3 && (
-                              <div style={{ marginTop: 8, color: "#92400E", fontSize: 11, fontWeight: 800 }}>
-                                Show more in spreadsheet →
+                              <div>
+                                <div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>REVENUE</div>
+                                <div style={{ color: G.mid, fontWeight: 900 }}>{fmt(summary.totalRevenue || 0)}</div>
                               </div>
-                            )}
-                          </button>
+
+                              <div>
+                                <div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>PROFIT</div>
+                                <div style={{ color: (summary.totalProfit || 0) >= 0 ? G.mid : G.red, fontWeight: 900 }}>
+                                  {fmt(summary.totalProfit || 0)}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
                         );
                       })}
+
+                      {selectedHistoryDate && selectedManualEntries.map((entry, i) => (
+                        <div
+                          key={entry.id || `${selectedHistoryDate}-manual-${i}`}
+                          style={{
+                            background: "#FFFBEB",
+                            border: "1px solid #FDE68A",
+                            borderLeft: `5px solid ${G.gold}`,
+                            borderRadius: 14,
+                            padding: "13px 14px",
+                          }}
+                        >
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 7 }}>
+                            <div style={{ color: G.dark, fontWeight: 900, fontSize: 13 }}>
+                              ➕ {entry.itemType || entry.type || "Manual entry"}
+                            </div>
+                            <div style={{ color: "#92400E", fontSize: 11, fontWeight: 800, whiteSpace: "nowrap" }}>
+                              {entry.createdAt
+                                ? new Date(entry.createdAt).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+                                : selectedHistoryDate}
+                            </div>
+                          </div>
+
+                          {(entry.brand || entry.details) && (
+                            <div style={{ color: G.muted, fontSize: 11, marginBottom: 8 }}>
+                              {entry.brand && <strong>{entry.brand}</strong>}
+                              {entry.brand && entry.details ? " · " : ""}
+                              {entry.details}
+                            </div>
+                          )}
+
+                          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, fontSize: 12 }}>
+                            <div>
+                              <div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>REVENUE</div>
+                              <div style={{ color: G.mid, fontWeight: 900 }}>{fmt(entry.revenue || 0)}</div>
+                            </div>
+                            <div>
+                              <div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>COST</div>
+                              <div style={{ color: G.muted, fontWeight: 900 }}>{fmt(entry.cost || 0)}</div>
+                            </div>
+                            <div>
+                              <div style={{ color: G.muted, fontSize: 10, fontWeight: 800 }}>PROFIT</div>
+                              <div style={{ color: (entry.profit || 0) >= 0 ? G.mid : G.red, fontWeight: 900 }}>
+                                {fmt(entry.profit || 0)}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
                     </div>
                   </div>
 
-                  {/* Calendar */}
-                  <div style={{ background: G.card, borderRadius: 16, border: "1px solid #E5F2EA", padding: 16, minHeight: 460 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
+                  {/* Right side calendar */}
+                  <div style={{
+                    background: G.card,
+                    borderRadius: 18,
+                    padding: 18,
+                    boxShadow: "0 2px 12px #0001",
+                    minHeight: 520,
+                  }}>
+                    <div style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 12,
+                      marginBottom: 16,
+                      flexWrap: "wrap",
+                    }}>
                       <div>
-                        <div style={{ color: G.dark, fontWeight: 900, fontSize: 14 }}>Calendar</div>
-                        <div style={{ color: G.muted, fontSize: 12, marginTop: 3 }}>Cleaner view: counts only, details on the left.</div>
+                        <div style={{ color: G.dark, fontWeight: 900, fontSize: 15 }}>
+                          Activity Calendar
+                        </div>
+                        <div style={{ color: G.muted, fontSize: 12, marginTop: 3 }}>
+                          Green dates have CSV uploads or manual entries.
+                        </div>
                       </div>
 
                       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                        <button onClick={() => changeCalendarMonth(-1)} style={{ width: 32, height: 32, borderRadius: "50%", border: "1px solid #E5E7EB", background: "#fff", color: G.dark, cursor: "pointer", fontWeight: 900 }}>‹</button>
-                        <div style={{ minWidth: 110, textAlign: "center", fontWeight: 900, color: G.dark }}>{getMonthLabel(calendarMonth)}</div>
-                        <button onClick={() => changeCalendarMonth(1)} style={{ width: 32, height: 32, borderRadius: "50%", border: "1px solid #E5E7EB", background: "#fff", color: G.dark, cursor: "pointer", fontWeight: 900 }}>›</button>
+                        <button
+                          onClick={() => changeCalendarMonth(-1)}
+                          style={{
+                            width: 32,
+                            height: 32,
+                            borderRadius: "50%",
+                            border: "1px solid #E5E7EB",
+                            background: "#fff",
+                            color: G.dark,
+                            cursor: "pointer",
+                            fontWeight: 900,
+                          }}
+                        >
+                          ‹
+                        </button>
+
+                        <div style={{ minWidth: 110, textAlign: "center", fontWeight: 900, color: G.dark }}>
+                          {getMonthLabel(calendarMonth)}
+                        </div>
+
+                        <button
+                          onClick={() => changeCalendarMonth(1)}
+                          style={{
+                            width: 32,
+                            height: 32,
+                            borderRadius: "50%",
+                            border: "1px solid #E5E7EB",
+                            background: "#fff",
+                            color: G.dark,
+                            cursor: "pointer",
+                            fontWeight: 900,
+                          }}
+                        >
+                          ›
+                        </button>
                       </div>
                     </div>
 
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 7, marginBottom: 12 }}>
+                    {/* Toggle controls */}
+                    <div style={{
+                      display: "flex",
+                      gap: 8,
+                      flexWrap: "wrap",
+                      marginBottom: 16,
+                      background: "#F9FBFA",
+                      padding: 8,
+                      borderRadius: 14,
+                      border: "1px solid #E5F2EA",
+                    }}>
+                      {[
+                        { value: "all", label: "All" },
+                        { value: "files", label: "📄 Files only" },
+                        { value: "manual", label: "＋ Plusses only" },
+                        { value: "none", label: "None" },
+                      ].map(mode => (
+                        <button
+                          key={mode.value}
+                          onClick={() => setHistoryIndicatorMode(mode.value)}
+                          style={{
+                            padding: "6px 11px",
+                            borderRadius: 999,
+                            border: "none",
+                            background: historyIndicatorMode === mode.value ? G.dark : "#fff",
+                            color: historyIndicatorMode === mode.value ? G.goldL : G.muted,
+                            fontSize: 11,
+                            fontWeight: 900,
+                            cursor: "pointer",
+                            boxShadow: historyIndicatorMode === mode.value ? "0 2px 8px #0002" : "0 1px 3px #0001",
+                          }}
+                        >
+                          {mode.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Calendar grid */}
+                    <div style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(7, 1fr)",
+                      gap: 8,
+                      marginBottom: 14,
+                    }}>
                       {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(day => (
-                        <div key={day} style={{ textAlign: "center", color: G.muted, fontSize: 10, fontWeight: 900, paddingBottom: 2 }}>{day}</div>
+                        <div key={day} style={{
+                          textAlign: "center",
+                          color: G.muted,
+                          fontSize: 11,
+                          fontWeight: 900,
+                          paddingBottom: 2,
+                        }}>
+                          {day}
+                        </div>
                       ))}
 
                       {calendarDays.map((date, i) => {
-                        if (!date) return <div key={`blank-${i}`} />;
+                        if (!date) {
+                          return <div key={`blank-${i}`} />;
+                        }
 
                         const files = importFilesByUploadDate[date] || [];
                         const manual = manualActivityByDate[date] || [];
@@ -2205,49 +1913,97 @@ setActiveTab("dashboard");
                         const hasManual = manual.length > 0;
                         const hasAction = hasFiles || hasManual;
                         const selected = selectedHistoryDate === date;
+
                         const showFiles = historyIndicatorMode === "all" || historyIndicatorMode === "files";
                         const showManual = historyIndicatorMode === "all" || historyIndicatorMode === "manual";
-                        const manualItemPreview = compactItemPreview(manual.flatMap(entry => entry.items || []), 3);
 
                         return (
                           <button
                             key={date}
                             onClick={() => setSelectedHistoryDate(date)}
-                            title={hasManual ? manualItemPreview : hasFiles ? `${files.length} CSV upload${files.length !== 1 ? "s" : ""}` : date}
                             style={{
-                              minHeight: 72,
-                              borderRadius: 14,
-                              border: selected ? `2px solid ${G.gold}` : hasAction ? "1px solid #B7E4C7" : "1px solid #E5E7EB",
-                              background: selected ? G.dark : hasAction ? "#F0FDF4" : "#fff",
+                              minHeight: 76,
+                              borderRadius: 16,
+                              border: selected
+                                ? `2px solid ${G.gold}`
+                                : hasAction
+                                  ? "1px solid #A7F3D0"
+                                  : "1px solid #E5E7EB",
+                              background: selected
+                                ? G.dark
+                                : hasAction
+                                  ? "#ECFDF5"
+                                  : "#fff",
                               color: selected ? "#fff" : G.dark,
                               cursor: "pointer",
-                              padding: "7px 5px",
+                              padding: "7px 6px",
                               display: "flex",
                               flexDirection: "column",
                               justifyContent: "space-between",
                               alignItems: "center",
-                              boxShadow: selected ? "0 6px 18px #0003" : "none",
+                              boxShadow: selected ? "0 6px 18px #0003" : hasAction ? "0 2px 8px #0001" : "none",
                             }}
                           >
-                            <div style={{ display: "flex", gap: 4, minHeight: 18, alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 900 }}>
-                              {showFiles && hasFiles && <span style={{ color: selected ? G.goldL : G.mid }}>📄{files.length > 1 ? files.length : ""}</span>}
-                              {showManual && hasManual && <span style={{ color: selected ? G.goldL : "#D97706" }}>+{manual.length}</span>}
+                            <div style={{ minHeight: 18, display: "flex", alignItems: "center", gap: 3 }}>
+                              {historyIndicatorMode !== "none" && showManual && hasManual && (
+                                <span style={{
+                                  color: selected ? G.goldL : "#D97706",
+                                  fontWeight: 1000,
+                                  fontSize: 15,
+                                  lineHeight: 1,
+                                }}>
+                                  {manual.length > 1 ? `+${manual.length}` : "+"}
+                                </span>
+                              )}
                             </div>
 
-                            <div style={{ fontSize: 15, fontWeight: 900 }}>{parseInt(date.slice(-2))}</div>
+                            <div style={{ minHeight: 20, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                              {historyIndicatorMode !== "none" && showFiles && hasFiles && (
+                                <span style={{ fontSize: 16 }}>
+                                  {files.length > 1 ? `📄${files.length}` : "📄"}
+                                </span>
+                              )}
+                            </div>
 
-                            <div style={{ minHeight: 12, fontSize: 9, color: selected ? "#D7E8DE" : G.muted, maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              {hasManual ? compactItemPreview(manual.flatMap(entry => entry.items || []), 1) : hasFiles ? "CSV" : ""}
+                            <div style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 5,
+                              fontWeight: 900,
+                              fontSize: 14,
+                            }}>
+                              {hasAction && (
+                                <span style={{
+                                  width: 7,
+                                  height: 7,
+                                  borderRadius: 2,
+                                  background: selected ? G.goldL : G.mid,
+                                  display: "inline-block",
+                                }} />
+                              )}
+                              {parseInt(date.slice(-2))}
                             </div>
                           </button>
                         );
                       })}
                     </div>
 
-                    <div style={{ display: "flex", gap: 12, flexWrap: "wrap", background: "#F9FBFA", borderRadius: 12, padding: "9px 11px", color: G.muted, fontSize: 12, border: "1px solid #E5F2EA" }}>
-                      <span>📄 CSV upload</span>
-                      <span><strong style={{ color: "#D97706" }}>+1</strong> manual entry</span>
-                      <span>Multiple items inside one manual entry still count as +1.</span>
+                    {/* Legend */}
+                    <div style={{
+                      display: "flex",
+                      gap: 12,
+                      flexWrap: "wrap",
+                      background: "#F9FBFA",
+                      borderRadius: 14,
+                      padding: "10px 12px",
+                      color: G.muted,
+                      fontSize: 12,
+                      border: "1px solid #E5F2EA",
+                    }}>
+                      <span><strong style={{ color: G.mid }}>■</strong> Activity</span>
+                      <span>📄 CSV uploaded</span>
+                      <span><strong style={{ color: "#D97706" }}>+</strong> Manual entry count</span>
+                      <span>Click any date to filter the left side.</span>
                     </div>
                   </div>
                 </div>
@@ -3274,32 +3030,24 @@ setActiveTab("dashboard");
           </div>
 
           {/* Manual entry */}
-          <div style={{ background: G.dark, borderRadius: 14, padding: "18px 22px", marginBottom: 24 }}>
-            <datalist id="manual-item-options">
-              {MANUAL_ITEM_SUGGESTIONS.map(option => <option key={option} value={option} />)}
-            </datalist>
-            <datalist id="manual-brand-options">
-              {MANUAL_BRAND_SUGGESTIONS.map(option => <option key={option} value={option} />)}
-            </datalist>
-
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
-              <div>
-                <div style={{ color: G.goldL, fontWeight: 800, fontSize: 14 }}>✏️ Manual Entry</div>
-                <div style={{ color: "#94A89A", fontSize: 12, marginTop: 4 }}>
-                  Add one manual entry with one or more item rows. It counts as one + marker on the calendar.
-                </div>
-              </div>
-              <button
-                onClick={() => setShowManualEntries(prev => !prev)}
-                style={{ padding: "8px 18px", background: "#1F4535", color: G.goldL, border: `1px solid ${G.mid}`, borderRadius: 999, cursor: "pointer", fontSize: 13, fontWeight: 800 }}
-              >
-                {showManualEntries ? "Hide Manual Entries ▲" : `View All Manual Entries (${manualEntriesAll.length}) ▼`}
-              </button>
+          <div style={{ background: G.dark, borderRadius: 14, padding: "18px 22px", marginBottom: 16 }}>
+            <div style={{ color: G.goldL, fontWeight: 700, fontSize: 14, marginBottom: 6 }}>
+              ✏️ Manual Entry
+            </div>
+            <div style={{ color: "#94A89A", fontSize: 12, marginBottom: 14 }}>
+              Add one manual adjustment at a time. Each save is tracked separately and counted on the activity calendar.
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 12, marginBottom: 14 }}>
+            <datalist id="manual-item-options">
+              {MANUAL_ITEM_SUGGESTIONS.map(item => <option key={item} value={item} />)}
+            </datalist>
+            <datalist id="manual-brand-options">
+              {MANUAL_BRAND_SUGGESTIONS.map(brand => <option key={brand} value={brand} />)}
+            </datalist>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
               <div>
-                <div style={{ color: "#94A89A", fontSize: 12, marginBottom: 5 }}>Date</div>
+                <div style={{ color: "#94A89A", fontSize: 12, marginBottom: 5 }}>Date *</div>
                 <input
                   type="date"
                   value={form.date}
@@ -3307,170 +3055,116 @@ setActiveTab("dashboard");
                   style={{ width: "100%", padding: "8px 11px", borderRadius: 8, border: `1px solid ${G.mid}`, background: "#1F4535", color: "#E8F5EE", fontSize: 13, outline: "none", boxSizing: "border-box" }}
                 />
               </div>
+
               <div>
-                <div style={{ color: "#94A89A", fontSize: 12, marginBottom: 5 }}>Entry notes optional</div>
+                <div style={{ color: "#94A89A", fontSize: 12, marginBottom: 5 }}>Net Revenue ($) *</div>
+                <input
+                  type="number"
+                  value={form.revenue}
+                  placeholder="e.g. 2400"
+                  onChange={e => setForm(p => ({ ...p, revenue: e.target.value }))}
+                  style={{ width: "100%", padding: "8px 11px", borderRadius: 8, border: `1px solid ${G.mid}`, background: "#1F4535", color: "#E8F5EE", fontSize: 13, outline: "none", boxSizing: "border-box" }}
+                />
+              </div>
+
+              <div>
+                <div style={{ color: "#94A89A", fontSize: 12, marginBottom: 5 }}>Total Costs ($) *</div>
+                <input
+                  type="number"
+                  value={form.cost}
+                  placeholder="e.g. 980"
+                  onChange={e => setForm(p => ({ ...p, cost: e.target.value }))}
+                  style={{ width: "100%", padding: "8px 11px", borderRadius: 8, border: `1px solid ${G.mid}`, background: "#1F4535", color: "#E8F5EE", fontSize: 13, outline: "none", boxSizing: "border-box" }}
+                />
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 2fr", gap: 12, marginBottom: 14 }}>
+              <div>
+                <div style={{ color: "#94A89A", fontSize: 12, marginBottom: 5 }}>Item / Type optional</div>
+                <input
+                  list="manual-item-options"
+                  value={form.itemType}
+                  placeholder="e.g. Bat"
+                  onChange={e => setForm(p => ({ ...p, itemType: e.target.value }))}
+                  style={{ width: "100%", padding: "8px 11px", borderRadius: 8, border: `1px solid ${G.mid}`, background: "#1F4535", color: "#E8F5EE", fontSize: 13, outline: "none", boxSizing: "border-box" }}
+                />
+              </div>
+
+              <div>
+                <div style={{ color: "#94A89A", fontSize: 12, marginBottom: 5 }}>Brand optional</div>
+                <input
+                  list="manual-brand-options"
+                  value={form.brand}
+                  placeholder="e.g. MRF"
+                  onChange={e => setForm(p => ({ ...p, brand: e.target.value }))}
+                  style={{ width: "100%", padding: "8px 11px", borderRadius: 8, border: `1px solid ${G.mid}`, background: "#1F4535", color: "#E8F5EE", fontSize: 13, outline: "none", boxSizing: "border-box" }}
+                />
+              </div>
+
+              <div>
+                <div style={{ color: "#94A89A", fontSize: 12, marginBottom: 5 }}>Details optional</div>
                 <input
                   type="text"
                   value={form.details}
-                  placeholder="e.g. Walk-in manual sale, adjustment, cash sale"
+                  placeholder="e.g. Walk-in bat sale, repair, adjustment"
                   onChange={e => setForm(p => ({ ...p, details: e.target.value }))}
                   style={{ width: "100%", padding: "8px 11px", borderRadius: 8, border: `1px solid ${G.mid}`, background: "#1F4535", color: "#E8F5EE", fontSize: 13, outline: "none", boxSizing: "border-box" }}
                 />
               </div>
             </div>
 
-            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 12 }}>
-              {manualItems.map((item, index) => {
-                const revenue = parseFloat(item.revenue) || 0;
-                const cost = parseFloat(item.cost) || 0;
-                const profit = revenue - cost;
-
-                return (
-                  <div key={item.id} style={{ background: "#1F4535", border: `1px solid ${G.mid}`, borderRadius: 12, padding: 12 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                      <div style={{ color: G.goldL, fontSize: 12, fontWeight: 900 }}>Item {index + 1}</div>
-                      {manualItems.length > 1 && (
-                        <button
-                          onClick={() => removeManualItemRow(item.id)}
-                          style={{ background: "transparent", border: "1px solid #ffffff22", color: "#FCA5A5", borderRadius: 8, padding: "3px 8px", cursor: "pointer", fontSize: 11, fontWeight: 800 }}
-                        >
-                          Remove
-                        </button>
-                      )}
-                    </div>
-
-                    <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr 70px 0.8fr 0.8fr", gap: 10, marginBottom: 10 }}>
-                      <div>
-                        <div style={{ color: "#94A89A", fontSize: 11, marginBottom: 4 }}>Item / Type</div>
-                        <input
-                          list="manual-item-options"
-                          value={item.itemType}
-                          placeholder="e.g. Bat"
-                          onChange={e => updateManualItem(item.id, { itemType: e.target.value })}
-                          style={{ width: "100%", padding: "7px 9px", borderRadius: 8, border: "1px solid #2D6A4F", background: G.dark, color: "#E8F5EE", fontSize: 12, outline: "none", boxSizing: "border-box" }}
-                        />
-                      </div>
-                      <div>
-                        <div style={{ color: "#94A89A", fontSize: 11, marginBottom: 4 }}>Brand</div>
-                        <input
-                          list="manual-brand-options"
-                          value={item.brand}
-                          placeholder="e.g. MRF"
-                          onChange={e => updateManualItem(item.id, { brand: e.target.value })}
-                          style={{ width: "100%", padding: "7px 9px", borderRadius: 8, border: "1px solid #2D6A4F", background: G.dark, color: "#E8F5EE", fontSize: 12, outline: "none", boxSizing: "border-box" }}
-                        />
-                      </div>
-                      <div>
-                        <div style={{ color: "#94A89A", fontSize: 11, marginBottom: 4 }}>Qty</div>
-                        <input
-                          type="number"
-                          value={item.qty}
-                          placeholder="1"
-                          onChange={e => updateManualItem(item.id, { qty: e.target.value })}
-                          style={{ width: "100%", padding: "7px 9px", borderRadius: 8, border: "1px solid #2D6A4F", background: G.dark, color: "#E8F5EE", fontSize: 12, outline: "none", boxSizing: "border-box" }}
-                        />
-                      </div>
-                      <div>
-                        <div style={{ color: "#94A89A", fontSize: 11, marginBottom: 4 }}>Revenue</div>
-                        <input
-                          type="number"
-                          value={item.revenue}
-                          placeholder="0"
-                          onChange={e => updateManualItem(item.id, { revenue: e.target.value })}
-                          style={{ width: "100%", padding: "7px 9px", borderRadius: 8, border: "1px solid #2D6A4F", background: G.dark, color: "#E8F5EE", fontSize: 12, outline: "none", boxSizing: "border-box" }}
-                        />
-                      </div>
-                      <div>
-                        <div style={{ color: "#94A89A", fontSize: 11, marginBottom: 4 }}>Cost</div>
-                        <input
-                          type="number"
-                          value={item.cost}
-                          placeholder="0"
-                          onChange={e => updateManualItem(item.id, { cost: e.target.value })}
-                          style={{ width: "100%", padding: "7px 9px", borderRadius: 8, border: "1px solid #2D6A4F", background: G.dark, color: "#E8F5EE", fontSize: 12, outline: "none", boxSizing: "border-box" }}
-                        />
-                      </div>
-                    </div>
-
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 10, alignItems: "center" }}>
-                      <input
-                        type="text"
-                        value={item.details}
-                        placeholder="Optional item details, e.g. size SH, custom grip, discount reason"
-                        onChange={e => updateManualItem(item.id, { details: e.target.value })}
-                        style={{ width: "100%", padding: "7px 9px", borderRadius: 8, border: "1px solid #2D6A4F", background: G.dark, color: "#E8F5EE", fontSize: 12, outline: "none", boxSizing: "border-box" }}
-                      />
-                      <div style={{ color: profit >= 0 ? G.goldL : "#FCA5A5", fontSize: 12, fontWeight: 900, whiteSpace: "nowrap" }}>
-                        Profit: {fmt(profit)}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-              <div style={{ color: "#94A89A", fontSize: 12 }}>
-                Entry total: <strong style={{ color: G.goldL }}>{fmt(manualItems.reduce((s, item) => s + (parseFloat(item.revenue) || 0), 0))}</strong> revenue · <strong style={{ color: G.goldL }}>{fmt(manualItems.reduce((s, item) => s + (parseFloat(item.cost) || 0), 0))}</strong> cost · <strong style={{ color: G.goldL }}>{fmt(manualItems.reduce((s, item) => s + ((parseFloat(item.revenue) || 0) - (parseFloat(item.cost) || 0)), 0))}</strong> profit
+            {form.revenue !== "" && form.cost !== "" && (
+              <div style={{ color: G.light, fontSize: 13, marginBottom: 12 }}>
+                Estimated manual profit: <strong style={{ color: ((parseFloat(form.revenue) || 0) - (parseFloat(form.cost) || 0)) >= 0 ? G.goldL : "#FCA5A5" }}>
+                  {fmt((parseFloat(form.revenue) || 0) - (parseFloat(form.cost) || 0))}
+                </strong>
               </div>
+            )}
 
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <button
-                  onClick={addManualItemRow}
-                  style={{ padding: "8px 16px", background: "#1F4535", color: G.goldL, border: `1px solid ${G.mid}`, borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 800 }}
-                >
-                  + Add Item Row
-                </button>
-                <button
-                  onClick={handleSave}
-                  style={{ padding: "8px 20px", background: G.gold, color: G.dark, fontWeight: 900, border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13 }}
-                >
-                  Save Manual Entry
-                </button>
-                <button onClick={() => {
-  if (!form.date) {
-    showToast("Pick a date first.", false);
-    return;
-  }
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+              <button
+                onClick={handleSave}
+                style={{ padding: "8px 20px", background: G.gold, color: G.dark, fontWeight: 800, border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13 }}
+              >
+                Save Manual Entry
+              </button>
 
-  const existing = entries[form.date];
+              <button
+                onClick={() => setShowManualEntries(prev => !prev)}
+                style={{ padding: "8px 18px", background: "#1F4535", color: G.goldL, border: `1px solid ${G.mid}`, borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 700 }}
+              >
+                {showManualEntries ? "Hide Manual Entries ▲" : `View All Manual Entries (${manualEntriesAll.length}) ▼`}
+              </button>
 
-  if (existing && existing.noSale) {
-    showToast(`${form.date} already marked as no-sale.`, false);
-    return;
-  }
-
-  const hasExistingActivity = existing && (
-    (existing.revenue || 0) !== 0 ||
-    (existing.cost || 0) !== 0 ||
-    (existing.profit || 0) !== 0 ||
-    (existing.items || []).length > 0 ||
-    (existing.manualEntries || []).length > 0
-  );
-
-  if (hasExistingActivity) {
-    showToast(`${form.date} already has data. Delete that day first if it should be no-sale.`, false);
-    return;
-  }
-
-  setEntries(prev => ({
-    ...prev,
-    [form.date]: {
-      revenue: 0,
-      cost: 0,
-      profit: 0,
-      tax: 0,
-      items: [],
-      manualEntries: [],
-      noSale: true,
-    },
-  }));
-
-  showToast(`${form.date} marked as no-sale day 🔕`);
-}} style={{ padding: "8px 18px", background: "transparent", color: "#94A89A", border: "1px solid #2D4A3A", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}>
-                  🔕 No-Sale Day
-                </button>
-              </div>
+              <button onClick={() => {
+                if (!form.date) { showToast("Pick a date first.", false); return; }
+                if (entries[form.date] && entries[form.date].noSale) {
+                  showToast(`${form.date} already marked as no-sale.`, false); return;
+                }
+                if (entries[form.date]) {
+                  if (!window.confirm(`${form.date} already has data. Mark as no-sale anyway?`)) return;
+                }
+                setEntries(prev => {
+                  const existing = prev[form.date] || {};
+                  return {
+                    ...prev,
+                    [form.date]: {
+                      ...existing,
+                      revenue: 0,
+                      cost: 0,
+                      profit: 0,
+                      tax: 0,
+                      items: existing.items || [],
+                      manualEntries: existing.manualEntries || [],
+                      noSale: true,
+                    },
+                  };
+                });
+                showToast(`${form.date} marked as no-sale day 🔕`);
+              }} style={{ padding: "8px 18px", background: "transparent", color: "#94A89A", border: "1px solid #2D4A3A", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}>
+                🔕 No-Sale Day
+              </button>
             </div>
           </div>
 
@@ -3480,20 +3174,11 @@ setActiveTab("dashboard");
                 <div>
                   <div style={{ color: G.dark, fontWeight: 900, fontSize: 15 }}>➕ All Manual Entries</div>
                   <div style={{ color: G.muted, fontSize: 12, marginTop: 3 }}>
-                    Each row below is one saved manual entry. Multiple item rows inside it still count as one calendar + marker.
+                    Each row is one manually saved entry. These are the entries counted as + markers on the calendar.
                   </div>
                 </div>
-                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                  <button
-                    onClick={openAllManualSpreadsheet}
-                    disabled={manualEntriesAll.length === 0}
-                    style={{ padding: "7px 13px", borderRadius: 999, border: "none", background: manualEntriesAll.length === 0 ? "#E5E7EB" : G.dark, color: manualEntriesAll.length === 0 ? G.muted : G.goldL, fontSize: 12, fontWeight: 900, cursor: manualEntriesAll.length === 0 ? "not-allowed" : "pointer" }}
-                  >
-                    Open Spreadsheet
-                  </button>
-                  <div style={{ background: "#F0F7F3", color: G.mid, borderRadius: 999, padding: "5px 12px", fontSize: 12, fontWeight: 900 }}>
-                    {manualEntriesAll.length} total
-                  </div>
+                <div style={{ background: "#F0F7F3", color: G.mid, borderRadius: 999, padding: "5px 12px", fontSize: 12, fontWeight: 900 }}>
+                  {manualEntriesAll.length} total
                 </div>
               </div>
 
@@ -3502,11 +3187,11 @@ setActiveTab("dashboard");
                   No manual entries yet. Save one above and it will appear here.
                 </div>
               ) : (
-                <div style={{ overflowX: "auto", maxHeight: 380, overflowY: "auto" }}>
+                <div style={{ overflowX: "auto", maxHeight: 360, overflowY: "auto" }}>
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                     <thead>
                       <tr style={{ background: G.dark, color: G.goldL }}>
-                        {["Date","Time Added","Items","Revenue","Cost","Profit","Preview","Details",""].map(h => (
+                        {["Date","Time Added","Revenue","Cost","Profit","Type","Brand","Details"].map(h => (
                           <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontWeight: 700, whiteSpace: "nowrap" }}>{h}</th>
                         ))}
                       </tr>
@@ -3517,26 +3202,21 @@ setActiveTab("dashboard");
                           <td style={{ padding: "8px 10px", fontWeight: 800, color: G.dark, whiteSpace: "nowrap" }}>{entry.date}</td>
                           <td style={{ padding: "8px 10px", color: G.muted, whiteSpace: "nowrap" }}>
                             {entry.createdAt
-                              ? new Date(entry.createdAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+                              ? new Date(entry.createdAt).toLocaleString("en-US", {
+                                  month: "short",
+                                  day: "numeric",
+                                  hour: "numeric",
+                                  minute: "2-digit",
+                                })
                               : "Older entry"}
                           </td>
-                          <td style={{ padding: "8px 10px", color: G.dark, fontWeight: 800 }}>{(entry.items || []).length || 1}</td>
                           <td style={{ padding: "8px 10px", color: G.mid, fontWeight: 800 }}>{fmt(entry.revenue || 0)}</td>
                           <td style={{ padding: "8px 10px", color: G.muted }}>{fmt(entry.cost || 0)}</td>
                           <td style={{ padding: "8px 10px", color: (entry.profit || 0) >= 0 ? G.mid : G.red, fontWeight: 800 }}>{fmt(entry.profit || 0)}</td>
-                          <td style={{ padding: "8px 10px", color: G.dark, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={compactItemPreview(entry.items || [], 20)}>
-                            {compactItemPreview(entry.items || [], 3)}
-                          </td>
+                          <td style={{ padding: "8px 10px", color: G.dark }}>{entry.itemType || "—"}</td>
+                          <td style={{ padding: "8px 10px", color: G.dark }}>{entry.brand || "—"}</td>
                           <td style={{ padding: "8px 10px", color: G.muted, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={entry.details || ""}>
                             {entry.details || "—"}
-                          </td>
-                          <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
-                            <button
-                              onClick={() => openManualSpreadsheet(entry)}
-                              style={{ padding: "5px 9px", borderRadius: 8, border: "1px solid #E5E7EB", background: "#fff", color: G.dark, cursor: "pointer", fontSize: 11, fontWeight: 800 }}
-                            >
-                              Spreadsheet
-                            </button>
                           </td>
                         </tr>
                       ))}
@@ -3879,9 +3559,9 @@ setActiveTab("dashboard");
                         <tr key={`${r.date}-items`}>
                           <td colSpan={8} style={{ padding: "0 0 8px 24px", background: "#F0F7F3" }}>
                             <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
-                                                            <thead>
+                              <thead>
                                 <tr style={{ color: G.muted }}>
-                                  {["Item","Cat","Channel","Net","Cost","Profit","Customer","Status"].map(h => (
+                                  {["Item","Cat","Channel","Net","Cost","Profit","Customer",""].map(h => (
                                     <th key={h} style={{ padding: "5px 10px", textAlign: "left", fontWeight: 600 }}>{h}</th>
                                   ))}
                                 </tr>
@@ -3889,69 +3569,32 @@ setActiveTab("dashboard");
                               <tbody>
                                 {r.items.map((item, j) => (
                                   <tr key={j} style={{ borderBottom: "1px solid #E0EDE6" }}>
-                                    <td style={{ padding: "5px 10px", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={item.item || item.itemType}>
-                                      {item.item || item.itemType || "Manual item"}
+                                    <td style={{ padding: "5px 10px", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={item.item}>{item.item}</td>
+                                    <td style={{ padding: "5px 10px", color: G.muted }}>{item.category}</td>
+                                    <td style={{ padding: "5px 10px" }}>{fmt(item.net)}</td>
+                                    <td style={{ padding: "5px 10px", color: item.costIsBlank ? "#D97706" : G.muted }}>
+                                      {item.costIsBlank ? <span title="Cost of Good was blank in the CSV">⚠️ $0.00</span> : fmt(item.cost)}
                                     </td>
-
-                                    <td style={{ padding: "5px 10px", color: G.muted }}>
-                                      {item.category || "—"}
-                                    </td>
-
+                                    <td style={{ padding: "5px 10px", fontWeight: 600, color: item.profit >= 0 ? G.mid : G.red }}>{fmt(item.profit)}</td>
                                     <td style={{ padding: "5px 10px" }}>
-                                      {item.channel && item.channel !== "Unknown" ? (
+                                      {item.channel && item.channel !== "Unknown" && (
                                         <span style={{
-                                          fontSize: 10,
-                                          fontWeight: 700,
-                                          padding: "2px 7px",
-                                          borderRadius: 10,
-                                          background: item.channel === "Online" ? "#DBEAFE" : item.channel === "Manual" ? "#FEF3C7" : "#D1FAE5",
-                                          color: item.channel === "Online" ? "#1D4ED8" : item.channel === "Manual" ? "#92400E" : G.mid,
-                                        }}>
-                                          {item.channel === "Online" ? "🌐 Online" : item.channel === "Manual" ? "✏️ Manual" : "🏪 In-Store"}
-                                        </span>
-                                      ) : (
-                                        <span style={{ color: G.muted }}>—</span>
+                                          fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 10,
+                                          background: item.channel === "Online" ? "#DBEAFE" : "#D1FAE5",
+                                          color: item.channel === "Online" ? "#1D4ED8" : G.mid,
+                                        }}>{item.channel === "Online" ? "🌐 Online" : "🏪 In-Store"}</span>
                                       )}
                                     </td>
-
-                                    <td style={{ padding: "5px 10px", color: (item.net || item.revenue || 0) < 0 ? G.red : G.mid }}>
-                                      {fmt(item.net ?? item.revenue ?? 0)}
-                                    </td>
-
-                                    <td style={{ padding: "5px 10px", color: item.costIsBlank ? "#D97706" : G.muted }}>
-                                      {item.costIsBlank ? <span title="Cost of Good was blank in the CSV">⚠️ $0.00</span> : fmt(item.cost || 0)}
-                                    </td>
-
-                                    <td style={{ padding: "5px 10px", fontWeight: 600, color: (item.profit || 0) >= 0 ? G.mid : G.red }}>
-                                      {fmt(item.profit || 0)}
-                                    </td>
-
-                                    <td style={{ padding: "5px 10px", color: G.muted }}>
-                                      {item.customer || item.details || "—"}
-                                    </td>
-
+                                    <td style={{ padding: "5px 10px", color: G.muted }}>{item.customer}</td>
                                     <td style={{ padding: "5px 10px" }}>
-                                      {item.isReturn ? (
-                                        <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 10, background: "#FEE2E2", color: G.red }}>
-                                          ↩ Return
-                                        </span>
-                                      ) : item.customer && item.customer !== "" ? (
+                                      {item.customer && item.customer !== "" && (
                                         <span style={{
-                                          fontSize: 10,
-                                          fontWeight: 700,
-                                          padding: "2px 7px",
-                                          borderRadius: 10,
+                                          fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 10,
                                           background: item.repeat && item.repeat.toLowerCase() === "yes" ? "#DBEAFE" : "#D1FAE5",
                                           color: item.repeat && item.repeat.toLowerCase() === "yes" ? "#1D4ED8" : G.mid,
                                         }}>
                                           {item.repeat && item.repeat.toLowerCase() === "yes" ? "↩ Returning" : "★ New"}
                                         </span>
-                                      ) : item.isManual ? (
-                                        <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 10, background: "#FEF3C7", color: "#92400E" }}>
-                                          Manual
-                                        </span>
-                                      ) : (
-                                        <span style={{ color: G.muted }}>—</span>
                                       )}
                                     </td>
                                   </tr>
@@ -3967,100 +3610,6 @@ setActiveTab("dashboard");
               </table>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Spreadsheet Viewer */}
-      {spreadsheetView && (
-        <div
-          onClick={() => setSpreadsheetView(null)}
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.58)",
-            zIndex: 998,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 18,
-          }}
-        >
-          <div
-            onClick={e => e.stopPropagation()}
-            style={{
-              width: "min(1180px, 96vw)",
-              maxHeight: "90vh",
-              background: G.card,
-              borderRadius: 20,
-              boxShadow: "0 28px 90px #0008",
-              overflow: "hidden",
-              display: "grid",
-              gridTemplateRows: "auto 1fr",
-            }}
-          >
-            <div style={{ background: G.dark, padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 14 }}>
-              <div>
-                <div style={{ color: G.goldL, fontWeight: 900, fontSize: 17 }}>📊 {spreadsheetView.title}</div>
-                <div style={{ color: "#A7B8AE", fontSize: 12, marginTop: 4 }}>{spreadsheetView.subtitle}</div>
-              </div>
-              <button
-                onClick={() => setSpreadsheetView(null)}
-                style={{ width: 34, height: 34, borderRadius: "50%", border: "1px solid #ffffff22", background: "#ffffff11", color: "#fff", cursor: "pointer", fontSize: 18, fontWeight: 900 }}
-              >
-                ×
-              </button>
-            </div>
-
-            <div style={{ overflow: "auto", padding: 16 }}>
-              {spreadsheetView.rows.length === 0 ? (
-                <div style={{ padding: 34, textAlign: "center", color: G.muted, background: "#F9FBFA", borderRadius: 14 }}>
-                  No spreadsheet rows to show.
-                </div>
-              ) : (
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: Math.max(720, spreadsheetView.headers.length * 130) }}>
-                  <thead>
-                    <tr style={{ background: G.dark, color: G.goldL }}>
-                      {spreadsheetView.headers.map(header => (
-                        <th key={header} style={{ position: "sticky", top: 0, background: G.dark, padding: "8px 10px", textAlign: "left", fontWeight: 800, whiteSpace: "nowrap", borderRight: "1px solid #ffffff18" }}>
-                          {header}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {spreadsheetView.rows.map((row, r) => (
-                      <tr key={r} style={{ background: r % 2 === 0 ? "#F9FBFA" : G.card, borderBottom: "1px solid #F0F0F0" }}>
-                        {spreadsheetView.headers.map(header => (
-                          <td key={header} style={{ padding: "7px 10px", whiteSpace: "nowrap", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", borderRight: "1px solid #F3F4F6" }} title={String(row[header] ?? "")}>
-                            {String(row[header] ?? "")}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {spreadsheetLoading && (
-        <div style={{
-          position: "fixed",
-          bottom: 78,
-          left: "50%",
-          transform: "translateX(-50%)",
-          background: G.dark,
-          color: G.goldL,
-          padding: "9px 18px",
-          borderRadius: 999,
-          fontSize: 13,
-          fontWeight: 800,
-          zIndex: 999,
-          boxShadow: "0 4px 16px #0003",
-        }}>
-          Opening spreadsheet...
         </div>
       )}
 
